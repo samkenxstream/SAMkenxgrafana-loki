@@ -99,7 +99,7 @@ require (
 	golang.org/x/crypto v0.0.0-20211215153901-e495a2d5b3d3
 	golang.org/x/net v0.0.0-20220127200216-cd36cc0744dd
 	golang.org/x/sync v0.0.0-20210220032951-036812b2e83c
-	golang.org/x/sys v0.0.0-20220222172238-00053529121e
+	golang.org/x/sys v0.0.0-20220722155257-8c9f86f7a55f
 	golang.org/x/time v0.0.0-20220210224613-90d013bbcef8
 	google.golang.org/api v0.70.0
 	google.golang.org/grpc v1.44.0
@@ -129,7 +129,7 @@ require (
 	github.com/Azure/go-autorest/tracing v0.6.0 // indirect
 	github.com/Masterminds/goutils v1.1.1 // indirect
 	github.com/Masterminds/semver/v3 v3.1.1 // indirect
-	github.com/Microsoft/go-winio v0.4.17 // indirect
+	github.com/Microsoft/go-winio v0.5.2 // indirect
 	github.com/PuerkitoBio/purell v1.1.1 // indirect
 	github.com/PuerkitoBio/urlesc v0.0.0-20170810143723-de5bf2ad4578 // indirect
 	github.com/alecthomas/template v0.0.0-20190718012654-fb15b899a751 // indirect
@@ -138,7 +138,7 @@ require (
 	github.com/armon/go-metrics v0.3.9 // indirect
 	github.com/asaskevich/govalidator v0.0.0-20200907205600-7a23bdc65eef // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
-	github.com/containerd/containerd v1.5.9 // indirect
+	github.com/containerd/containerd v1.5.18 // indirect
 	github.com/containerd/fifo v1.0.0 // indirect
 	github.com/coreos/etcd v3.3.25+incompatible // indirect
 	github.com/coreos/go-semver v0.3.0 // indirect
@@ -211,7 +211,7 @@ require (
 	github.com/mailru/easyjson v0.7.6 // indirect
 	github.com/mattn/go-colorable v0.1.9 // indirect
 	github.com/mattn/go-isatty v0.0.14 // indirect
-	github.com/matttproud/golang_protobuf_extensions v1.0.2-0.20181231171920-c182affec369 // indirect
+	github.com/matttproud/golang_protobuf_extensions v1.0.4 // indirect
 	github.com/miekg/dns v1.1.46 // indirect
 	github.com/minio/md5-simd v1.1.0 // indirect
 	github.com/minio/sha256-simd v0.1.1 // indirect
