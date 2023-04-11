@@ -1,17 +1,23 @@
 package storage
 
 import (
-	lokiv1beta1 "github.com/grafana/loki/operator/api/v1beta1"
+	lokiv1 "github.com/grafana/loki/operator/apis/loki/v1"
 )
 
 // Options is used to configure Loki to integrate with
 // supported object storages.
 type Options struct {
-	SharedStore lokiv1beta1.ObjectStorageSecretType
-	Azure       *AzureStorageConfig
-	GCS         *GCSStorageConfig
-	S3          *S3StorageConfig
-	Swift       *SwiftStorageConfig
+	Schemas     []lokiv1.ObjectStorageSchema
+	SharedStore lokiv1.ObjectStorageSecretType
+
+	Azure        *AzureStorageConfig
+	GCS          *GCSStorageConfig
+	S3           *S3StorageConfig
+	Swift        *SwiftStorageConfig
+	AlibabaCloud *AlibabaCloudStorageConfig
+
+	SecretName string
+	TLS        *TLSConfig
 }
 
 // AzureStorageConfig for Azure storage config
@@ -52,4 +58,19 @@ type SwiftStorageConfig struct {
 	ProjectDomainName string
 	Region            string
 	Container         string
+}
+
+// AlibabaCloudStorageConfig for AlibabaCloud storage config
+type AlibabaCloudStorageConfig struct {
+	Endpoint        string
+	Bucket          string
+	AccessKeyID     string
+	SecretAccessKey string
+}
+
+// TLSConfig for object storage endpoints. Currently supported only by:
+// - S3
+type TLSConfig struct {
+	CA  string
+	Key string
 }

@@ -2,6 +2,7 @@ package client
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,7 +12,11 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/weaveworks/common/user"
 )
+
+const requestTimeout = 30 * time.Second
 
 type roundTripper struct {
 	instanceID    string
@@ -30,14 +35,12 @@ func (r *roundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
 		for _, v := range values {
 			req.Header.Add(key, v)
 		}
-
-		fmt.Println(req.Header.Values(key))
 	}
 
 	return r.next.RoundTrip(req)
 }
 
-type CortexClientOption interface {
+type Option interface {
 	Type() string
 }
 
@@ -57,7 +60,7 @@ type Client struct {
 }
 
 // NewLogsClient creates a new client
-func New(instanceID, token, baseURL string, opts ...CortexClientOption) *Client {
+func New(instanceID, token, baseURL string, opts ...Option) *Client {
 	rt := &roundTripper{
 		instanceID: instanceID,
 		token:      token,
@@ -187,7 +190,7 @@ func (c *Client) Metrics() (string, error) {
 
 // Flush all in-memory chunks held by the ingesters to the backing store
 func (c *Client) Flush() error {
-	req, err := c.request("POST", fmt.Sprintf("%s/flush", c.baseURL))
+	req, err := c.request(context.Background(), "POST", fmt.Sprintf("%s/flush", c.baseURL))
 	if err != nil {
 		return err
 	}
@@ -247,15 +250,13 @@ func (c *Client) AddDeleteRequest(params DeleteRequestParams) error {
 
 type DeleteRequests []DeleteRequest
 type DeleteRequest struct {
-	RequestID string  `json:"request_id"`
-	StartTime float64 `json:"start_time"`
-	EndTime   float64 `json:"end_time"`
-	Query     string  `json:"query"`
-	Status    string  `json:"status"`
-	CreatedAt float64 `json:"created_at"`
+	StartTime int64  `json:"start_time"`
+	EndTime   int64  `json:"end_time"`
+	Query     string `json:"query"`
+	Status    string `json:"status"`
 }
 
-// GetDeleteRequest gets a delete request using the request ID
+// GetDeleteRequests returns all delete requests
 func (c *Client) GetDeleteRequests() (DeleteRequests, error) {
 	resp, err := c.Get("/loki/api/v1/delete")
 	if err != nil {
@@ -361,9 +362,27 @@ type Response struct {
 	Data   DataType
 }
 
+type RulesResponse struct {
+	Status string
+	Data   RulesData
+}
+
+type RulesData struct {
+	Groups []Rules
+}
+
+type Rules struct {
+	Name  string
+	File  string
+	Rules []interface{}
+}
+
 // RunRangeQuery runs a query and returns an error if anything went wrong
-func (c *Client) RunRangeQuery(query string) (*Response, error) {
-	buf, statusCode, err := c.run(c.rangeQueryURL(query))
+func (c *Client) RunRangeQuery(ctx context.Context, query string) (*Response, error) {
+	ctx, cancelFunc := context.WithTimeout(ctx, requestTimeout)
+	defer cancelFunc()
+
+	buf, statusCode, err := c.run(ctx, c.rangeQueryURL(query))
 	if err != nil {
 		return nil, err
 	}
@@ -372,7 +391,10 @@ func (c *Client) RunRangeQuery(query string) (*Response, error) {
 }
 
 // RunQuery runs a query and returns an error if anything went wrong
-func (c *Client) RunQuery(query string) (*Response, error) {
+func (c *Client) RunQuery(ctx context.Context, query string) (*Response, error) {
+	ctx, cancelFunc := context.WithTimeout(ctx, requestTimeout)
+	defer cancelFunc()
+
 	v := url.Values{}
 	v.Set("query", query)
 	v.Set("time", formatTS(c.Now.Add(time.Second)))
@@ -384,25 +406,51 @@ func (c *Client) RunQuery(query string) (*Response, error) {
 	u.Path = "/loki/api/v1/query"
 	u.RawQuery = v.Encode()
 
-	buf, statusCode, err := c.run(u.String())
+	buf, statusCode, err := c.run(ctx, u.String())
 	if err != nil {
 		return nil, err
 	}
 
 	return c.parseResponse(buf, statusCode)
+
+}
+
+// GetRules returns the loki ruler rules
+func (c *Client) GetRules(ctx context.Context) (*RulesResponse, error) {
+	ctx, cancelFunc := context.WithTimeout(ctx, requestTimeout)
+	defer cancelFunc()
+
+	u, err := url.Parse(c.baseURL)
+	if err != nil {
+		return nil, err
+	}
+	u.Path = "/prometheus/api/v1/rules"
+
+	buf, _, err := c.run(ctx, u.String())
+	if err != nil {
+		return nil, err
+	}
+
+	resp := RulesResponse{}
+	err = json.Unmarshal(buf, &resp)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing response data %q: %w", buf, err)
+	}
+
+	return &resp, err
 }
 
 func (c *Client) parseResponse(buf []byte, statusCode int) (*Response, error) {
+	if statusCode/100 != 2 {
+		return nil, fmt.Errorf("request failed with status code %d: %w", statusCode, errors.New(string(buf)))
+	}
 	lokiResp := Response{}
 	err := json.Unmarshal(buf, &lokiResp)
 	if err != nil {
-		return nil, fmt.Errorf("error parsing response data: %w", err)
+		return nil, fmt.Errorf("error parsing response data '%s': %w", string(buf), err)
 	}
 
-	if statusCode/100 == 2 {
-		return &lokiResp, nil
-	}
-	return nil, fmt.Errorf("request failed with status code %d: %w", statusCode, errors.New(string(buf)))
+	return &lokiResp, nil
 }
 
 func (c *Client) rangeQueryURL(query string) string {
@@ -421,28 +469,25 @@ func (c *Client) rangeQueryURL(query string) string {
 	return u.String()
 }
 
-func (c *Client) LabelNames() ([]string, error) {
+func (c *Client) LabelNames(ctx context.Context) ([]string, error) {
+	ctx, cancelFunc := context.WithTimeout(ctx, requestTimeout)
+	defer cancelFunc()
+
 	url := fmt.Sprintf("%s/loki/api/v1/labels", c.baseURL)
 
-	req, err := c.request("GET", url)
+	buf, statusCode, err := c.run(ctx, url)
 	if err != nil {
 		return nil, err
 	}
 
-	res, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer res.Body.Close()
-
-	if res.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("Unexpected status code of %d", res.StatusCode)
+	if statusCode/100 != 2 {
+		return nil, fmt.Errorf("request failed with status code %d: %w", statusCode, errors.New(string(buf)))
 	}
 
 	var values struct {
 		Data []string `json:"data"`
 	}
-	if err := json.NewDecoder(res.Body).Decode(&values); err != nil {
+	if err := json.Unmarshal(buf, &values); err != nil {
 		return nil, err
 	}
 
@@ -450,10 +495,13 @@ func (c *Client) LabelNames() ([]string, error) {
 }
 
 // LabelValues return a LabelValues query
-func (c *Client) LabelValues(labelName string) ([]string, error) {
+func (c *Client) LabelValues(ctx context.Context, labelName string) ([]string, error) {
+	ctx, cancelFunc := context.WithTimeout(ctx, requestTimeout)
+	defer cancelFunc()
+
 	url := fmt.Sprintf("%s/loki/api/v1/label/%s/values", c.baseURL, url.PathEscape(labelName))
 
-	req, err := c.request("GET", url)
+	req, err := c.request(ctx, "GET", url)
 	if err != nil {
 		return nil, err
 	}
@@ -465,7 +513,7 @@ func (c *Client) LabelValues(labelName string) ([]string, error) {
 	defer res.Body.Close()
 
 	if res.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("Unexpected status code of %d", res.StatusCode)
+		return nil, fmt.Errorf("unexpected status code of %d", res.StatusCode)
 	}
 
 	var values struct {
@@ -478,8 +526,9 @@ func (c *Client) LabelValues(labelName string) ([]string, error) {
 	return values.Data, nil
 }
 
-func (c *Client) request(method string, url string) (*http.Request, error) {
-	req, err := http.NewRequest(method, url, nil)
+func (c *Client) request(ctx context.Context, method string, url string) (*http.Request, error) {
+	ctx = user.InjectOrgID(ctx, c.instanceID)
+	req, err := http.NewRequestWithContext(ctx, method, url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -487,8 +536,8 @@ func (c *Client) request(method string, url string) (*http.Request, error) {
 	return req, nil
 }
 
-func (c *Client) run(u string) ([]byte, int, error) {
-	req, err := c.request("GET", u)
+func (c *Client) run(ctx context.Context, u string) ([]byte, int, error) {
+	req, err := c.request(ctx, "GET", u)
 	if err != nil {
 		return nil, 0, err
 	}

@@ -6,10 +6,12 @@ import (
 	"sync"
 
 	"github.com/go-kit/log/level"
+	"github.com/opentracing/opentracing-go"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 	"github.com/prometheus/prometheus/promql"
 
+	"github.com/grafana/loki/pkg/logqlmodel/stats"
 	"github.com/grafana/loki/pkg/storage/chunk"
 	"github.com/grafana/loki/pkg/storage/chunk/cache"
 	"github.com/grafana/loki/pkg/storage/chunk/client"
@@ -37,6 +39,15 @@ var (
 		Name:      "cache_corrupt_chunks_total",
 		Help:      "Total count of corrupt chunks found in cache.",
 	})
+	chunkFetchedSize = promauto.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace: "loki",
+		Subsystem: "chunk_fetcher",
+		Name:      "fetched_size_bytes",
+		Help:      "Compressed chunk size distribution fetched from storage.",
+		// TODO: expand these buckets if we ever make larger chunks
+		// TODO: consider adding `chunk_target_size` to this list in case users set very large chunk sizes
+		Buckets: []float64{128, 1024, 16 * 1024, 64 * 1024, 128 * 1024, 256 * 1024, 512 * 1024, 1024 * 1024, 1.5 * 1024 * 1024, 2 * 1024 * 1024, 4 * 1024 * 1024},
+	}, []string{"source"})
 )
 
 const chunkDecodeParallelism = 16
@@ -164,7 +175,9 @@ func (c *Fetcher) FetchChunks(ctx context.Context, chunks []chunk.Chunk, keys []
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
-	log, ctx := spanlogger.New(ctx, "ChunkStore.FetchChunks")
+	sp, ctx := opentracing.StartSpanFromContext(ctx, "ChunkStore.FetchChunks")
+	defer sp.Finish()
+	log := spanlogger.FromContext(ctx)
 	defer log.Span.Finish()
 
 	// Now fetch the actual chunk data from Memcache / S3
@@ -172,6 +185,11 @@ func (c *Fetcher) FetchChunks(ctx context.Context, chunks []chunk.Chunk, keys []
 	if err != nil {
 		level.Warn(log).Log("msg", "error fetching from cache", "err", err)
 	}
+
+	for _, buf := range cacheBufs {
+		chunkFetchedSize.WithLabelValues("cache").Observe(float64(len(buf)))
+	}
+
 	fromCache, missing, err := c.processCacheResponse(ctx, chunks, cacheHits, cacheBufs)
 	if err != nil {
 		level.Warn(log).Log("msg", "error process response from cache", "err", err)
@@ -181,6 +199,20 @@ func (c *Fetcher) FetchChunks(ctx context.Context, chunks []chunk.Chunk, keys []
 	if len(missing) > 0 {
 		fromStorage, err = c.storage.GetChunks(ctx, missing)
 	}
+
+	// normally these stats would be collected by the cache.statsCollector wrapper, but chunks are written back
+	// to the cache asynchronously in the background and we lose the context
+	var bytes int
+	for _, c := range fromStorage {
+		size := c.Data.Size()
+		bytes += size
+
+		chunkFetchedSize.WithLabelValues("store").Observe(float64(size))
+	}
+
+	st := stats.FromContext(ctx)
+	st.AddCacheEntriesStored(stats.ChunkCache, len(fromStorage))
+	st.AddCacheBytesSent(stats.ChunkCache, bytes)
 
 	// Always cache any chunks we did get
 	if cacheErr := c.writeBackCacheAsync(fromStorage); cacheErr != nil {

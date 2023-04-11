@@ -23,7 +23,7 @@ import (
 // - Deployment
 // - StatefulSet
 // - ServiceMonitor
-func MutateFuncFor(existing, desired client.Object) controllerutil.MutateFn {
+func MutateFuncFor(existing, desired client.Object, depAnnotations map[string]string) controllerutil.MutateFn {
 	return func() error {
 		existingAnnotations := existing.GetAnnotations()
 		if err := mergeWithOverride(&existingAnnotations, desired.GetAnnotations()); err != nil {
@@ -37,11 +37,25 @@ func MutateFuncFor(existing, desired client.Object) controllerutil.MutateFn {
 		}
 		existing.SetLabels(existingLabels)
 
+		if ownerRefs := desired.GetOwnerReferences(); len(ownerRefs) > 0 {
+			existing.SetOwnerReferences(ownerRefs)
+		}
+
 		switch existing.(type) {
 		case *corev1.ConfigMap:
 			cm := existing.(*corev1.ConfigMap)
 			wantCm := desired.(*corev1.ConfigMap)
 			mutateConfigMap(cm, wantCm)
+
+		case *corev1.Secret:
+			s := existing.(*corev1.Secret)
+			wantS := desired.(*corev1.Secret)
+			mutateSecret(s, wantS)
+			existingAnnotations := s.GetAnnotations()
+			if err := mergeWithOverride(&existingAnnotations, depAnnotations); err != nil {
+				return err
+			}
+			s.SetAnnotations(existingAnnotations)
 
 		case *corev1.Service:
 			svc := existing.(*corev1.Service)
@@ -120,7 +134,15 @@ func mergeWithOverride(dst, src interface{}) error {
 }
 
 func mutateConfigMap(existing, desired *corev1.ConfigMap) {
+	existing.Annotations = desired.Annotations
+	existing.Labels = desired.Labels
 	existing.BinaryData = desired.BinaryData
+	existing.Data = desired.Data
+}
+
+func mutateSecret(existing, desired *corev1.Secret) {
+	existing.Annotations = desired.Annotations
+	existing.Labels = desired.Labels
 	existing.Data = desired.Data
 }
 
@@ -156,6 +178,10 @@ func mutateRoleBinding(existing, desired *rbacv1.RoleBinding) {
 func mutateServiceMonitor(existing, desired *monitoringv1.ServiceMonitor) {
 	// ServiceMonitor selector is immutable so we set this value only if
 	// a new object is going to be created
+	existing.Annotations = desired.Annotations
+	existing.Labels = desired.Labels
+	existing.Spec.Endpoints = desired.Spec.Endpoints
+	existing.Spec.JobLabel = desired.Spec.JobLabel
 }
 
 func mutateIngress(existing, desired *networkingv1.Ingress) {
@@ -208,13 +234,7 @@ func mutateStatefulSet(existing, desired *appsv1.StatefulSet) error {
 	if existing.CreationTimestamp.IsZero() {
 		existing.Spec.Selector = desired.Spec.Selector
 	}
-	existing.Spec.PodManagementPolicy = desired.Spec.PodManagementPolicy
 	existing.Spec.Replicas = desired.Spec.Replicas
-	for i := range existing.Spec.VolumeClaimTemplates {
-		existing.Spec.VolumeClaimTemplates[i].TypeMeta = desired.Spec.VolumeClaimTemplates[i].TypeMeta
-		existing.Spec.VolumeClaimTemplates[i].ObjectMeta = desired.Spec.VolumeClaimTemplates[i].ObjectMeta
-		existing.Spec.VolumeClaimTemplates[i].Spec = desired.Spec.VolumeClaimTemplates[i].Spec
-	}
 	if err := mergeWithOverride(&existing.Spec.Template, desired.Spec.Template); err != nil {
 		return err
 	}

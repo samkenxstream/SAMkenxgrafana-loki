@@ -1,7 +1,10 @@
 package manifests
 
 import (
-	lokiv1beta1 "github.com/grafana/loki/operator/api/v1beta1"
+	"strings"
+
+	configv1 "github.com/grafana/loki/operator/apis/config/v1"
+	lokiv1 "github.com/grafana/loki/operator/apis/loki/v1"
 	"github.com/grafana/loki/operator/internal/manifests/internal"
 	"github.com/grafana/loki/operator/internal/manifests/openshift"
 	"github.com/grafana/loki/operator/internal/manifests/storage"
@@ -10,37 +13,30 @@ import (
 // Options is a set of configuration values to use when building manifests such as resource sizes, etc.
 // Most of this should be provided - either directly or indirectly - by the user.
 type Options struct {
-	Name              string
-	Namespace         string
-	Image             string
-	GatewayImage      string
-	GatewayBaseDomain string
-	ConfigSHA1        string
+	Name                   string
+	Namespace              string
+	Image                  string
+	GatewayImage           string
+	GatewayBaseDomain      string
+	ConfigSHA1             string
+	CertRotationRequiredAt string
 
-	Flags FeatureFlags
-
-	Stack                lokiv1beta1.LokiStackSpec
+	Gates                configv1.FeatureGates
+	Stack                lokiv1.LokiStackSpec
 	ResourceRequirements internal.ComponentResources
 
-	AlertingRules  []lokiv1beta1.AlertingRule
-	RecordingRules []lokiv1beta1.RecordingRule
+	AlertingRules       []lokiv1.AlertingRule
+	RecordingRules      []lokiv1.RecordingRule
+	RulesConfigMapNames []string
+	Ruler               Ruler
 
 	ObjectStorage storage.Options
 
 	OpenShiftOptions openshift.Options
 
 	Tenants Tenants
-}
 
-// FeatureFlags contains flags that activate various features
-type FeatureFlags struct {
-	EnableCertificateSigningService bool
-	EnableServiceMonitors           bool
-	EnableTLSServiceMonitorConfig   bool
-	EnablePrometheusAlerts          bool
-	EnableGateway                   bool
-	EnableGatewayRoute              bool
-	EnableGrafanaLabsStats          bool
+	TLSProfile TLSProfileSpec
 }
 
 // Tenants contains the configuration per tenant and secrets for authn/authz.
@@ -76,4 +72,36 @@ type TenantOPASpec struct{}
 // TenantOpenShiftSpec config for OpenShift authentication options (e.g. used in openshift-logging mode)
 type TenantOpenShiftSpec struct {
 	CookieSecret string
+}
+
+// Ruler configuration for manifests generation.
+type Ruler struct {
+	Spec   *lokiv1.RulerConfigSpec
+	Secret *RulerSecret
+}
+
+// RulerSecret defines the ruler secret for remote write client auth
+type RulerSecret struct {
+	// Username for basic authentication only.
+	Username string
+	// Password for basic authentication only.
+	Password string
+	// BearerToken contains the token used for bearer authentication.
+	BearerToken string
+}
+
+// TLSProfileSpec is the desired behavior of a TLSProfileType.
+type TLSProfileSpec struct {
+	// Ciphers is used to specify the cipher algorithms that are negotiated
+	// during the TLS handshake.
+	Ciphers []string
+	// MinTLSVersion is used to specify the minimal version of the TLS protocol
+	// that is negotiated during the TLS handshake.
+	MinTLSVersion string
+}
+
+// TLSCipherSuites transforms TLSProfileSpec.Ciphers from a slice
+// to a string of elements joined with a comma.
+func (o Options) TLSCipherSuites() string {
+	return strings.Join(o.TLSProfile.Ciphers, ",")
 }

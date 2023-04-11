@@ -1,38 +1,28 @@
 package tsdb
 
 import (
-	"bytes"
 	"context"
 	"io"
-	"io/ioutil"
-	"strings"
+	"time"
 
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 
-	"github.com/grafana/loki/pkg/chunkenc"
 	"github.com/grafana/loki/pkg/storage/chunk"
 	index_shipper "github.com/grafana/loki/pkg/storage/stores/indexshipper/index"
 	"github.com/grafana/loki/pkg/storage/stores/tsdb/index"
 )
 
-const (
-	gzipSuffix = ".gz"
-)
+// GetRawFileReaderFunc returns an io.ReadSeeker for reading raw tsdb file from disk
+type GetRawFileReaderFunc func() (io.ReadSeeker, error)
 
 func OpenShippableTSDB(p string) (index_shipper.Index, error) {
-	var gz bool
-	trimmed := strings.TrimSuffix(p, gzipSuffix)
-	if trimmed != p {
-		gz = true
-	}
-
-	id, err := identifierFromPath(trimmed)
+	id, err := identifierFromPath(p)
 	if err != nil {
 		return nil, err
 	}
 
-	return NewShippableTSDBFile(id, gz)
+	return NewShippableTSDBFile(id)
 }
 
 // nolint
@@ -45,23 +35,19 @@ type TSDBFile struct {
 	Index
 
 	// to sastisfy Reader() and Close() methods
-	r io.ReadSeeker
+	getRawFileReader GetRawFileReaderFunc
 }
 
-func NewShippableTSDBFile(id Identifier, gzip bool) (*TSDBFile, error) {
-	if gzip {
-		id = newSuffixedIdentifier(id, gzipSuffix)
-	}
-
-	idx, b, err := NewTSDBIndexFromFile(id.Path(), gzip)
+func NewShippableTSDBFile(id Identifier) (*TSDBFile, error) {
+	idx, getRawFileReader, err := NewTSDBIndexFromFile(id.Path())
 	if err != nil {
 		return nil, err
 	}
 
 	return &TSDBFile{
-		Identifier: id,
-		Index:      idx,
-		r:          bytes.NewReader(b),
+		Identifier:       id,
+		Index:            idx,
+		getRawFileReader: getRawFileReader,
 	}, err
 }
 
@@ -70,7 +56,7 @@ func (f *TSDBFile) Close() error {
 }
 
 func (f *TSDBFile) Reader() (io.ReadSeeker, error) {
-	return f.r, nil
+	return f.getRawFileReader()
 }
 
 // nolint
@@ -82,33 +68,17 @@ type TSDBIndex struct {
 	chunkFilter chunk.RequestChunkFilterer
 }
 
-// Return the index as well as the underlying []byte which isn't exposed as an index
+// Return the index as well as the underlying raw file reader which isn't exposed as an index
 // method but is helpful for building an io.reader for the index shipper
-func NewTSDBIndexFromFile(location string, gzip bool) (*TSDBIndex, []byte, error) {
-	raw, err := ioutil.ReadFile(location)
+func NewTSDBIndexFromFile(location string) (*TSDBIndex, GetRawFileReaderFunc, error) {
+	reader, err := index.NewFileReader(location)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	cleaned := raw
-
-	// decompress if needed
-	if gzip {
-		r := chunkenc.Gzip.GetReader(bytes.NewReader(raw))
-		defer chunkenc.Gzip.PutReader(r)
-
-		var err error
-		cleaned, err = io.ReadAll(r)
-		if err != nil {
-			return nil, nil, err
-		}
-	}
-
-	reader, err := index.NewReader(index.RealByteSlice(cleaned))
-	if err != nil {
-		return nil, nil, err
-	}
-	return NewTSDBIndex(reader), cleaned, nil
+	return NewTSDBIndex(reader), func() (io.ReadSeeker, error) {
+		return reader.RawFileReader()
+	}, nil
 }
 
 func NewTSDBIndex(reader IndexReader) *TSDBIndex {
@@ -132,12 +102,7 @@ func (i *TSDBIndex) SetChunkFilterer(chunkFilter chunk.RequestChunkFilterer) {
 
 // fn must NOT capture it's arguments. They're reused across series iterations and returned to
 // a pool after completion.
-func (i *TSDBIndex) forSeries(
-	ctx context.Context,
-	shard *index.ShardAnnotation,
-	fn func(labels.Labels, model.Fingerprint, []index.ChunkMeta),
-	matchers ...*labels.Matcher,
-) error {
+func (i *TSDBIndex) forSeries(ctx context.Context, shard *index.ShardAnnotation, from model.Time, through model.Time, fn func(labels.Labels, model.Fingerprint, []index.ChunkMeta), matchers ...*labels.Matcher) error {
 	p, err := PostingsForMatchers(i.reader, shard, matchers...)
 	if err != nil {
 		return err
@@ -153,7 +118,7 @@ func (i *TSDBIndex) forSeries(
 	}
 
 	for p.Next() {
-		hash, err := i.reader.Series(p.At(), &ls, &chks)
+		hash, err := i.reader.Series(p.At(), int64(from), int64(through), &ls, &chks)
 		if err != nil {
 			return err
 		}
@@ -173,32 +138,23 @@ func (i *TSDBIndex) forSeries(
 }
 
 func (i *TSDBIndex) GetChunkRefs(ctx context.Context, userID string, from, through model.Time, res []ChunkRef, shard *index.ShardAnnotation, matchers ...*labels.Matcher) ([]ChunkRef, error) {
-	queryBounds := newBounds(from, through)
 	if res == nil {
 		res = ChunkRefsPool.Get()
 	}
 	res = res[:0]
 
-	if err := i.forSeries(ctx, shard,
-		func(ls labels.Labels, fp model.Fingerprint, chks []index.ChunkMeta) {
-			// TODO(owen-d): use logarithmic approach
-			for _, chk := range chks {
+	if err := i.forSeries(ctx, shard, from, through, func(ls labels.Labels, fp model.Fingerprint, chks []index.ChunkMeta) {
+		for _, chk := range chks {
 
-				// current chunk is outside the range of this request
-				if !Overlap(queryBounds, chk) {
-					continue
-				}
-
-				res = append(res, ChunkRef{
-					User:        userID, // assumed to be the same, will be enforced by caller.
-					Fingerprint: fp,
-					Start:       chk.From(),
-					End:         chk.Through(),
-					Checksum:    chk.Checksum,
-				})
-			}
-		},
-		matchers...); err != nil {
+			res = append(res, ChunkRef{
+				User:        userID, // assumed to be the same, will be enforced by caller.
+				Fingerprint: fp,
+				Start:       chk.From(),
+				End:         chk.Through(),
+				Checksum:    chk.Checksum,
+			})
+		}
+	}, matchers...); err != nil {
 		return nil, err
 	}
 
@@ -206,27 +162,20 @@ func (i *TSDBIndex) GetChunkRefs(ctx context.Context, userID string, from, throu
 }
 
 func (i *TSDBIndex) Series(ctx context.Context, _ string, from, through model.Time, res []Series, shard *index.ShardAnnotation, matchers ...*labels.Matcher) ([]Series, error) {
-	queryBounds := newBounds(from, through)
 	if res == nil {
 		res = SeriesPool.Get()
 	}
 	res = res[:0]
 
-	if err := i.forSeries(ctx, shard,
-		func(ls labels.Labels, fp model.Fingerprint, chks []index.ChunkMeta) {
-			// TODO(owen-d): use logarithmic approach
-			for _, chk := range chks {
-				if Overlap(queryBounds, chk) {
-					// this series has at least one chunk in the desired range
-					res = append(res, Series{
-						Labels:      ls.Copy(),
-						Fingerprint: fp,
-					})
-					break
-				}
-			}
-		},
-		matchers...); err != nil {
+	if err := i.forSeries(ctx, shard, from, through, func(ls labels.Labels, fp model.Fingerprint, chks []index.ChunkMeta) {
+		if len(chks) == 0 {
+			return
+		}
+		res = append(res, Series{
+			Labels:      ls.Copy(),
+			Fingerprint: fp,
+		})
+	}, matchers...); err != nil {
 		return nil, err
 	}
 
@@ -252,12 +201,31 @@ func (i *TSDBIndex) Checksum() uint32 {
 	return i.reader.Checksum()
 }
 
-func (i *TSDBIndex) Identifier(tenant string) SingleTenantTSDBIdentifier {
+func (i *TSDBIndex) Identifier(string) SingleTenantTSDBIdentifier {
 	lower, upper := i.Bounds()
 	return SingleTenantTSDBIdentifier{
-		Tenant:   tenant,
+		TS:       time.Now(),
 		From:     lower,
 		Through:  upper,
 		Checksum: i.Checksum(),
 	}
+}
+
+func (i *TSDBIndex) Stats(ctx context.Context, userID string, from, through model.Time, acc IndexStatsAccumulator, shard *index.ShardAnnotation, shouldIncludeChunk shouldIncludeChunk, matchers ...*labels.Matcher) error {
+	if err := i.forSeries(ctx, shard, from, through, func(ls labels.Labels, fp model.Fingerprint, chks []index.ChunkMeta) {
+		var addedStream bool
+		for _, chk := range chks {
+			if shouldIncludeChunk(chk) {
+				if !addedStream {
+					acc.AddStream(fp)
+					addedStream = true
+				}
+				acc.AddChunk(fp, chk)
+			}
+		}
+	}, matchers...); err != nil {
+		return err
+	}
+
+	return nil
 }

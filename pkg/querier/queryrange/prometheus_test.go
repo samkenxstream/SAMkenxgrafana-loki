@@ -47,14 +47,45 @@ var emptyStats = `"stats": {
 			}
 		}
 	},
+	"cache": {
+		"chunk": {
+			"entriesFound": 0,
+			"entriesRequested": 0,
+			"entriesStored": 0,
+			"bytesReceived": 0,
+			"bytesSent": 0,
+			"requests": 0,
+			"downloadTime": 0
+		},
+		"index": {
+			"entriesFound": 0,
+			"entriesRequested": 0,
+			"entriesStored": 0,
+			"bytesReceived": 0,
+			"bytesSent": 0,
+			"requests": 0,
+			"downloadTime": 0
+		},
+		"result": {
+			"entriesFound": 0,
+			"entriesRequested": 0,
+			"entriesStored": 0,
+			"bytesReceived": 0,
+			"bytesSent": 0,
+			"requests": 0,
+			"downloadTime": 0
+		}
+	},
 	"summary": {
 		"bytesProcessedPerSecond": 0,
 		"execTime": 0,
 		"linesProcessedPerSecond": 0,
 		"queueTime": 0,
+		"splits": 0,
+		"shards": 0,
 		"subqueries": 0,
 		"totalBytesProcessed":0,
-                "totalEntriesReturned":0,
+		"totalEntriesReturned":0,
 		"totalLinesProcessed":0
 	}
 }`

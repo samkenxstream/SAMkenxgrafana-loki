@@ -19,6 +19,7 @@ import (
 	"github.com/weaveworks/common/user"
 
 	"github.com/grafana/loki/pkg/ingester/client"
+	"github.com/grafana/loki/pkg/logqlmodel/stats"
 	"github.com/grafana/loki/pkg/storage"
 	"github.com/grafana/loki/pkg/storage/chunk"
 	"github.com/grafana/loki/pkg/storage/chunk/cache"
@@ -54,7 +55,7 @@ var (
 				flagext.DefaultValues(&storeCfg)
 				storeCfg.WriteDedupeCacheConfig.Cache = cache.NewFifoCache("test", cache.FifoCacheConfig{
 					MaxSizeItems: 500,
-				}, prometheus.NewRegistry(), log.NewNopLogger())
+				}, prometheus.NewRegistry(), log.NewNopLogger(), stats.ChunkCache)
 				return storeCfg
 			},
 		},
@@ -138,26 +139,39 @@ func TestChunkStore_LabelValuesForMetricName(t *testing.T) {
 	for _, tc := range []struct {
 		metricName, labelName string
 		expect                []string
+		matchers              []*labels.Matcher
 	}{
 		{
 			`foo`, `bar`,
 			[]string{"baz", "beep", "bop"},
+			nil,
 		},
 		{
 			`bar`, `toms`,
 			[]string{"code"},
+			nil,
 		},
 		{
 			`bar`, `bar`,
 			[]string{"baz"},
+			nil,
 		},
 		{
 			`foo`, `foo`,
+			nil,
 			nil,
 		},
 		{
 			`foo`, `flip`,
 			[]string{"flap", "flop"},
+			nil,
+		},
+		{
+			`foo`, `toms`,
+			[]string{"code"},
+			[]*labels.Matcher{
+				labels.MustNewMatcher(labels.MatchRegexp, "bar", "baz|beep"),
+			},
 		},
 	} {
 		for _, schema := range schemas {
@@ -179,7 +193,7 @@ func TestChunkStore_LabelValuesForMetricName(t *testing.T) {
 					}
 
 					// Query with ordinary time-range
-					labelValues1, err := store.LabelValuesForMetricName(ctx, userID, now.Add(-time.Hour), now, tc.metricName, tc.labelName)
+					labelValues1, err := store.LabelValuesForMetricName(ctx, userID, now.Add(-time.Hour), now, tc.metricName, tc.labelName, tc.matchers...)
 					require.NoError(t, err)
 
 					if !reflect.DeepEqual(tc.expect, labelValues1) {
@@ -187,7 +201,7 @@ func TestChunkStore_LabelValuesForMetricName(t *testing.T) {
 					}
 
 					// Pushing end of time-range into future should yield exact same resultset
-					labelValues2, err := store.LabelValuesForMetricName(ctx, userID, now.Add(-time.Hour), now.Add(time.Hour*24*10), tc.metricName, tc.labelName)
+					labelValues2, err := store.LabelValuesForMetricName(ctx, userID, now.Add(-time.Hour), now.Add(time.Hour*24*10), tc.metricName, tc.labelName, tc.matchers...)
 					require.NoError(t, err)
 
 					if !reflect.DeepEqual(tc.expect, labelValues2) {
@@ -195,7 +209,7 @@ func TestChunkStore_LabelValuesForMetricName(t *testing.T) {
 					}
 
 					// Query with both begin & end of time-range in future should yield empty resultset
-					labelValues3, err := store.LabelValuesForMetricName(ctx, userID, now.Add(time.Hour), now.Add(time.Hour*2), tc.metricName, tc.labelName)
+					labelValues3, err := store.LabelValuesForMetricName(ctx, userID, now.Add(time.Hour), now.Add(time.Hour*2), tc.metricName, tc.labelName, tc.matchers...)
 					require.NoError(t, err)
 					if len(labelValues3) != 0 {
 						t.Fatalf("%s/%s: future query should yield empty resultset ... actually got %v label values: %#v",
@@ -455,54 +469,54 @@ func Test_GetSeries(t *testing.T) {
 		{
 			`foo`,
 			[]labels.Labels{
-				ch1lbs.WithoutLabels(labels.MetricName),
-				ch2lbs.WithoutLabels(labels.MetricName),
+				labels.NewBuilder(ch1lbs).Del(labels.MetricName).Labels(nil),
+				labels.NewBuilder(ch2lbs).Del(labels.MetricName).Labels(nil),
 			},
 		},
 		{
 			`foo{flip=""}`,
-			[]labels.Labels{ch2lbs.WithoutLabels(labels.MetricName)},
+			[]labels.Labels{labels.NewBuilder(ch2lbs).Del(labels.MetricName).Labels(nil)},
 		},
 		{
 			`foo{bar="baz"}`,
-			[]labels.Labels{ch1lbs.WithoutLabels(labels.MetricName)},
+			[]labels.Labels{labels.NewBuilder(ch1lbs).Del(labels.MetricName).Labels(nil)},
 		},
 		{
 			`foo{bar="beep"}`,
-			[]labels.Labels{ch2lbs.WithoutLabels(labels.MetricName)},
+			[]labels.Labels{labels.NewBuilder(ch2lbs).Del(labels.MetricName).Labels(nil)},
 		},
 		{
 			`foo{toms="code"}`,
 			[]labels.Labels{
-				ch1lbs.WithoutLabels(labels.MetricName),
-				ch2lbs.WithoutLabels(labels.MetricName),
+				labels.NewBuilder(ch1lbs).Del(labels.MetricName).Labels(nil),
+				labels.NewBuilder(ch2lbs).Del(labels.MetricName).Labels(nil),
 			},
 		},
 		{
 			`foo{bar!="baz"}`,
-			[]labels.Labels{ch2lbs.WithoutLabels(labels.MetricName)},
+			[]labels.Labels{labels.NewBuilder(ch2lbs).Del(labels.MetricName).Labels(nil)},
 		},
 		{
 			`foo{bar=~"beep|baz"}`,
 			[]labels.Labels{
-				ch1lbs.WithoutLabels(labels.MetricName),
-				ch2lbs.WithoutLabels(labels.MetricName),
+				labels.NewBuilder(ch1lbs).Del(labels.MetricName).Labels(nil),
+				labels.NewBuilder(ch2lbs).Del(labels.MetricName).Labels(nil),
 			},
 		},
 		{
 			`foo{bar=~"beeping|baz"}`,
-			[]labels.Labels{ch1lbs.WithoutLabels(labels.MetricName)},
+			[]labels.Labels{labels.NewBuilder(ch1lbs).Del(labels.MetricName).Labels(nil)},
 		},
 		{
 			`foo{toms="code", bar=~"beep|baz"}`,
 			[]labels.Labels{
-				ch1lbs.WithoutLabels(labels.MetricName),
-				ch2lbs.WithoutLabels(labels.MetricName),
+				labels.NewBuilder(ch1lbs).Del(labels.MetricName).Labels(nil),
+				labels.NewBuilder(ch2lbs).Del(labels.MetricName).Labels(nil),
 			},
 		},
 		{
 			`foo{toms="code", bar="baz"}`,
-			[]labels.Labels{ch1lbs.WithoutLabels(labels.MetricName)},
+			[]labels.Labels{labels.NewBuilder(ch1lbs).Del(labels.MetricName).Labels(nil)},
 		},
 	}
 	for _, schema := range schemas {
@@ -555,11 +569,11 @@ func Test_GetSeriesShard(t *testing.T) {
 	}{
 		{
 			`foo{__cortex_shard__="6_of_16"}`,
-			[]labels.Labels{ch2lbs.WithoutLabels(labels.MetricName)},
+			[]labels.Labels{labels.NewBuilder(ch2lbs).Del(labels.MetricName).Labels(nil)},
 		},
 		{
 			`foo{__cortex_shard__="8_of_16"}`,
-			[]labels.Labels{ch1lbs.WithoutLabels(labels.MetricName)},
+			[]labels.Labels{labels.NewBuilder(ch1lbs).Del(labels.MetricName).Labels(nil)},
 		},
 	}
 	for _, storeCase := range stores {
@@ -628,7 +642,7 @@ func TestChunkStoreError(t *testing.T) {
 			query:   "foo",
 			from:    model.Time(0),
 			through: model.Time(0).Add(31 * 24 * time.Hour),
-			err:     "the query time range exceeds the limit (query length: 744h0m0s, limit: 720h0m0s)",
+			err:     "the query time range exceeds the limit (query length: 31d, limit: 30d)",
 		},
 		{
 			query:   "{foo=\"bar\"}",
@@ -697,6 +711,13 @@ func TestSeriesStore_LabelValuesForMetricName(t *testing.T) {
 			[]*labels.Matcher{
 				labels.MustNewMatcher(labels.MatchNotEqual, "env", "prod"),
 				labels.MustNewMatcher(labels.MatchEqual, "toms", "code"),
+			},
+		},
+		{
+			`foo`, `toms`,
+			[]string{"code"},
+			[]*labels.Matcher{
+				labels.MustNewMatcher(labels.MatchRegexp, "env", "dev|prod"),
 			},
 		},
 	} {

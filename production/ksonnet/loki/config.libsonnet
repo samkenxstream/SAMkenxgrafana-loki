@@ -3,6 +3,9 @@
     namespace: error 'must define namespace',
     cluster: error 'must define cluster',
     http_listen_port: 3100,
+    node_selector: null,
+
+    create_service_monitor: false,
 
     replication_factor: 3,
     memcached_replicas: 3,
@@ -47,6 +50,14 @@
       // A higher value will lead to a querier trying to process more requests than there are available
       // cores and will result in scheduling delays.
       concurrency: 4,
+
+      // If use_topology_spread is true, queriers can run on nodes already running queriers but will be
+      // spread through the available nodes using a TopologySpreadConstraints with a max skew
+      // of topology_spread_max_skew.
+      // See: https://kubernetes.io/docs/concepts/workloads/pods/pod-topology-spread-constraints/
+      // If use_topology_spread is false, queriers will not be scheduled on nodes already running queriers.
+      use_topology_spread: true,
+      topology_spread_max_skew: 1,
     },
 
     queryFrontend: {
@@ -66,6 +77,15 @@
     index_period_hours: 24,  // 1 day
 
     ruler_enabled: false,
+
+    distributor: {
+      use_topology_spread: true,
+      topology_spread_max_skew: 1,
+    },
+
+    ingester_allow_multiple_replicas_on_same_node: false,
+    ingester_data_disk_size: '10Gi',
+    ingester_data_disk_class: 'fast',
 
     // Bigtable variables
     bigtable_instance: error 'must specify bigtable instance',
@@ -144,6 +164,9 @@
     commonEnvs: [],
 
     loki: {
+      common: {
+        compactor_address: 'http://compactor.%s.svc.cluster.local.:%d' % [$._config.namespace, $._config.http_listen_port],
+      },
       server: {
         graceful_shutdown_timeout: '5s',
         http_server_idle_timeout: '120s',
@@ -158,7 +181,6 @@
       frontend: {
         compress_responses: true,
         log_queries_longer_than: '5s',
-        compactor_address: 'http://compactor.%s.svc.cluster.local:%d' % [$._config.namespace, $._config.http_listen_port],
       },
       frontend_worker: {
         match_max_concurrent: true,
@@ -217,7 +239,7 @@
           ring: {
             heartbeat_timeout: '1m',
             replication_factor: $._config.replication_factor,
-            kvstore: {
+            kvstore: if $._config.memberlist_ring_enabled then {} else {
               store: 'consul',
               consul: {
                 host: 'consul.%s.svc.cluster.local:8500' % $._config.namespace,
@@ -284,19 +306,6 @@
             consistent_hash: true,
           },
         },
-
-        write_dedupe_cache_config: {
-          memcached: {
-            batch_size: 100,
-            parallelism: 100,
-          },
-
-          memcached_client: {
-            host: 'memcached-index-writes.%s.svc.cluster.local' % $._config.namespace,
-            service: 'memcached-client',
-            consistent_hash: true,
-          },
-        },
       },
 
       // Default schema config is boltdb-shipper/gcs, this will need to be overridden for other stores
@@ -323,7 +332,7 @@
       distributor: {
         // Creates a ring between distributors, required by the ingestion rate global limit.
         ring: {
-          kvstore: {
+          kvstore: if $._config.memberlist_ring_enabled then {} else {
             store: 'consul',
             consul: {
               host: 'consul.%s.svc.cluster.local:8500' % $._config.namespace,
@@ -343,7 +352,7 @@
         enable_sharding: true,
         enable_alertmanager_v2: true,
         ring: {
-          kvstore: {
+          kvstore: if $._config.memberlist_ring_enabled then {} else {
             store: 'consul',
             consul: {
               host: 'consul.%s.svc.cluster.local:8500' % $._config.namespace,
@@ -376,4 +385,5 @@
     deployment.mixin.spec.template.metadata.withAnnotationsMixin({
       config_hash: std.md5(std.toString($._config.loki)),
     }),
+
 }

@@ -1,6 +1,7 @@
 package integration
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -9,15 +10,27 @@ import (
 
 	"github.com/grafana/loki/integration/client"
 	"github.com/grafana/loki/integration/cluster"
+
+	"github.com/grafana/loki/pkg/util/querylimits"
 )
 
 func TestMicroServicesIngestQuery(t *testing.T) {
-	clu := cluster.New()
+	clu := cluster.New(nil)
 	defer func() {
 		assert.NoError(t, clu.Cleanup())
 	}()
 
+	// run initially the compactor, indexgateway, and distributor.
 	var (
+		tCompactor = clu.AddComponent(
+			"compactor",
+			"-target=compactor",
+			"-boltdb.shipper.compactor.compaction-interval=1s",
+			"-boltdb.shipper.compactor.retention-delete-delay=1s",
+			// By default, a minute is added to the delete request start time. This compensates for that.
+			"-boltdb.shipper.compactor.delete-request-cancel-period=-60s",
+			"-compactor.deletion-mode=filter-and-delete",
+		)
 		tIndexGateway = clu.AddComponent(
 			"index-gateway",
 			"-target=index-gateway",
@@ -26,40 +39,53 @@ func TestMicroServicesIngestQuery(t *testing.T) {
 			"distributor",
 			"-target=distributor",
 		)
+	)
+	require.NoError(t, clu.Run())
+
+	// then, run only the ingester and query scheduler.
+	var (
 		tIngester = clu.AddComponent(
 			"ingester",
 			"-target=ingester",
-			"-boltdb.shipper.index-gateway-client.server-address="+tIndexGateway.GRPCURL().Host,
+			"-boltdb.shipper.index-gateway-client.server-address="+tIndexGateway.GRPCURL(),
 		)
 		tQueryScheduler = clu.AddComponent(
 			"query-scheduler",
 			"-target=query-scheduler",
-			"-boltdb.shipper.index-gateway-client.server-address="+tIndexGateway.GRPCURL().Host,
+			"-query-scheduler.use-scheduler-ring=false",
+			"-boltdb.shipper.index-gateway-client.server-address="+tIndexGateway.GRPCURL(),
 		)
+	)
+	require.NoError(t, clu.Run())
+
+	// finally, run the query-frontend and querier.
+	var (
 		tQueryFrontend = clu.AddComponent(
 			"query-frontend",
 			"-target=query-frontend",
-			"-frontend.scheduler-address="+tQueryScheduler.GRPCURL().Host,
-			"-boltdb.shipper.index-gateway-client.server-address="+tIndexGateway.GRPCURL().Host,
+			"-frontend.scheduler-address="+tQueryScheduler.GRPCURL(),
+			"-boltdb.shipper.index-gateway-client.server-address="+tIndexGateway.GRPCURL(),
+			"-common.compactor-address="+tCompactor.HTTPURL(),
+			"-querier.per-request-limits-enabled=true",
 		)
 		_ = clu.AddComponent(
 			"querier",
 			"-target=querier",
-			"-querier.scheduler-address="+tQueryScheduler.GRPCURL().Host,
-			"-boltdb.shipper.index-gateway-client.server-address="+tIndexGateway.GRPCURL().Host,
+			"-querier.scheduler-address="+tQueryScheduler.GRPCURL(),
+			"-boltdb.shipper.index-gateway-client.server-address="+tIndexGateway.GRPCURL(),
+			"-common.compactor-address="+tCompactor.HTTPURL(),
 		)
 	)
-
 	require.NoError(t, clu.Run())
 
-	tenantID := randStringRunes(12)
+	tenantID := randStringRunes()
 
 	now := time.Now()
-	cliDistributor := client.New(tenantID, "", tDistributor.HTTPURL().String())
+	cliDistributor := client.New(tenantID, "", tDistributor.HTTPURL())
 	cliDistributor.Now = now
-	cliIngester := client.New(tenantID, "", tIngester.HTTPURL().String())
+	cliIngester := client.New(tenantID, "", tIngester.HTTPURL())
 	cliIngester.Now = now
-	cliQueryFrontend := client.New(tenantID, "", tQueryFrontend.HTTPURL().String())
+	cliQueryFrontend := client.New(tenantID, "", tQueryFrontend.HTTPURL())
 	cliQueryFrontend.Now = now
 
 	t.Run("ingest-logs-store", func(t *testing.T) {
@@ -79,7 +105,7 @@ func TestMicroServicesIngestQuery(t *testing.T) {
 	})
 
 	t.Run("query", func(t *testing.T) {
-		resp, err := cliQueryFrontend.RunRangeQuery(`{job="fake"}`)
+		resp, err := cliQueryFrontend.RunRangeQuery(context.Background(), `{job="fake"}`)
 		require.NoError(t, err)
 		assert.Equal(t, "streams", resp.Data.ResultType)
 
@@ -93,14 +119,23 @@ func TestMicroServicesIngestQuery(t *testing.T) {
 	})
 
 	t.Run("label-names", func(t *testing.T) {
-		resp, err := cliQueryFrontend.LabelNames()
+		resp, err := cliQueryFrontend.LabelNames(context.Background())
 		require.NoError(t, err)
 		assert.ElementsMatch(t, []string{"job"}, resp)
 	})
 
 	t.Run("label-values", func(t *testing.T) {
-		resp, err := cliQueryFrontend.LabelValues("job")
+		resp, err := cliQueryFrontend.LabelValues(context.Background(), "job")
 		require.NoError(t, err)
 		assert.ElementsMatch(t, []string{"fake"}, resp)
+	})
+
+	t.Run("per-request-limits", func(t *testing.T) {
+		queryLimitsPolicy := client.InjectHeadersOption(map[string][]string{querylimits.HTTPHeaderQueryLimitsKey: {`{"maxQueryLength": "1m"}`}})
+		cliQueryFrontendLimited := client.New(tenantID, "", tQueryFrontend.HTTPURL(), queryLimitsPolicy)
+		cliQueryFrontendLimited.Now = now
+
+		_, err := cliQueryFrontendLimited.LabelNames(context.Background())
+		require.ErrorContains(t, err, "the query time range exceeds the limit (query length")
 	})
 }

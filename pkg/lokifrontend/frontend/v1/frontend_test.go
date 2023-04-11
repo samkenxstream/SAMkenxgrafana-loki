@@ -3,7 +3,7 @@ package v1
 import (
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"strings"
@@ -55,7 +55,7 @@ func TestFrontend(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, 200, resp.StatusCode)
 
-		body, err := ioutil.ReadAll(resp.Body)
+		body, err := io.ReadAll(resp.Body)
 		require.NoError(t, err)
 
 		assert.Equal(t, "Hello World", string(body))
@@ -105,7 +105,7 @@ func TestFrontendPropagateTrace(t *testing.T) {
 		require.Equal(t, 200, resp.StatusCode)
 
 		defer resp.Body.Close()
-		_, err = ioutil.ReadAll(resp.Body)
+		_, err = io.ReadAll(resp.Body)
 		require.NoError(t, err)
 
 		// Query should do one call.
@@ -126,12 +126,10 @@ func TestFrontendCheckReady(t *testing.T) {
 		{"no url, no clients is not ready", 0, "not ready: number of queriers connected to query-frontend is 0", false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
+			qm := queue.NewMetrics("query_frontend", nil)
 			f := &Frontend{
-				log: log.NewNopLogger(),
-				requestQueue: queue.NewRequestQueue(5, 0,
-					prometheus.NewGaugeVec(prometheus.GaugeOpts{}, []string{"user"}),
-					prometheus.NewCounterVec(prometheus.CounterOpts{}, []string{"user"}),
-				),
+				log:          log.NewNopLogger(),
+				requestQueue: queue.NewRequestQueue(5, 0, qm),
 			}
 			for i := 0; i < tt.connectedClients; i++ {
 				f.requestQueue.RegisterQuerierConnection("test")
@@ -201,7 +199,7 @@ func TestFrontendMetricsCleanup(t *testing.T) {
 			require.Equal(t, 200, resp.StatusCode)
 			defer resp.Body.Close()
 
-			body, err := ioutil.ReadAll(resp.Body)
+			body, err := io.ReadAll(resp.Body)
 			require.NoError(t, err)
 
 			assert.Equal(t, "Hello World", string(body))

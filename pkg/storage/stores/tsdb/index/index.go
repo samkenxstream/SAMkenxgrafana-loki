@@ -22,11 +22,12 @@ import (
 	"hash"
 	"hash/crc32"
 	"io"
-	"io/ioutil"
 	"math"
 	"os"
 	"path/filepath"
 	"sort"
+	"sync"
+	"time"
 	"unsafe"
 
 	"github.com/pkg/errors"
@@ -34,6 +35,7 @@ import (
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/storage"
 	tsdb_enc "github.com/prometheus/prometheus/tsdb/encoding"
+	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
 	"github.com/prometheus/prometheus/tsdb/fileutil"
 
 	"github.com/grafana/loki/pkg/util/encoding"
@@ -54,6 +56,8 @@ const (
 
 	// store every 1024 series' fingerprints in the fingerprint offsets table
 	fingerprintInterval = 1 << 10
+
+	millisecondsInHour = int64(time.Hour / time.Millisecond)
 )
 
 type indexWriterStage uint8
@@ -535,16 +539,19 @@ func (w *Writer) AddSeries(ref storage.SeriesRef, lset labels.Labels, fp model.F
 
 	w.buf2.PutHash(w.crc32)
 
-	if err := w.write(w.buf1.Get(), w.buf2.Get()); err != nil {
-		return errors.Wrap(err, "write series data")
-	}
-
 	w.lastSeries = append(w.lastSeries[:0], lset...)
 	w.lastSeriesHash = labelHash
 	w.lastRef = ref
 
 	if ref%fingerprintInterval == 0 {
-		w.fingerprintOffsets = append(w.fingerprintOffsets, [2]uint64{uint64(ref), labelHash})
+		// series references are the 16-byte aligned offsets
+		// Do NOT ask me how long I debugged this particular bit >:O
+		sRef := w.f.pos / 16
+		w.fingerprintOffsets = append(w.fingerprintOffsets, [2]uint64{sRef, labelHash})
+	}
+
+	if err := w.write(w.buf1.Get(), w.buf2.Get()); err != nil {
+		return errors.Wrap(err, "write series data")
 	}
 
 	return nil
@@ -1197,22 +1204,21 @@ func (b RealByteSlice) Sub(start, end int) ByteSlice {
 // NewReader returns a new index reader on the given byte slice. It automatically
 // handles different format versions.
 func NewReader(b ByteSlice) (*Reader, error) {
-	return newReader(b, ioutil.NopCloser(nil))
+	return newReader(b, io.NopCloser(nil))
 }
-
-type nopCloser struct{}
-
-func (nopCloser) Close() error { return nil }
 
 // NewFileReader returns a new index reader against the given index file.
 func NewFileReader(path string) (*Reader, error) {
-	b, err := ioutil.ReadFile(path)
+	f, err := fileutil.OpenMmapFile(path)
 	if err != nil {
 		return nil, err
 	}
-	r, err := newReader(RealByteSlice(b), nopCloser{})
+	r, err := newReader(RealByteSlice(f.Bytes()), f)
 	if err != nil {
-		return r, err
+		return nil, tsdb_errors.NewMulti(
+			err,
+			f.Close(),
+		).Err()
 	}
 
 	return r, nil
@@ -1326,7 +1332,10 @@ func newReader(b ByteSlice, c io.Closer) (*Reader, error) {
 		return nil, errors.Wrap(err, "loading fingerprint offsets")
 	}
 
-	r.dec = &Decoder{LookupSymbol: r.lookupSymbol}
+	r.dec = &Decoder{
+		LookupSymbol: r.lookupSymbol,
+		chunksSample: map[storage.SeriesRef]*chunkSamples{},
+	}
 
 	return r, nil
 }
@@ -1334,6 +1343,10 @@ func newReader(b ByteSlice, c io.Closer) (*Reader, error) {
 // Version returns the file format version of the underlying index.
 func (r *Reader) Version() int {
 	return r.version
+}
+
+func (r *Reader) RawFileReader() (io.ReadSeeker, error) {
+	return bytes.NewReader(r.b.Range(0, r.b.Len())), nil
 }
 
 // Range marks a byte range.
@@ -1581,8 +1594,6 @@ func (r *Reader) SymbolTableSize() uint64 {
 }
 
 // SortedLabelValues returns value tuples that exist for the given label name.
-// It is not safe to use the return value beyond the lifetime of the byte slice
-// passed into the Reader.
 func (r *Reader) SortedLabelValues(name string, matchers ...*labels.Matcher) ([]string, error) {
 	values, err := r.LabelValues(name, matchers...)
 	if err == nil && r.version == FormatV1 {
@@ -1592,8 +1603,6 @@ func (r *Reader) SortedLabelValues(name string, matchers ...*labels.Matcher) ([]
 }
 
 // LabelValues returns value tuples that exist for the given label name.
-// It is not safe to use the return value beyond the lifetime of the byte slice
-// passed into the Reader.
 // TODO(replay): Support filtering by matchers
 func (r *Reader) LabelValues(name string, matchers ...*labels.Matcher) ([]string, error) {
 	if len(matchers) > 0 {
@@ -1637,7 +1646,7 @@ func (r *Reader) LabelValues(name string, matchers ...*labels.Matcher) ([]string
 		} else {
 			d.Skip(skip)
 		}
-		s := yoloString(d.UvarintBytes()) // Label value.
+		s := string(d.UvarintBytes()) // Label value.
 		values = append(values, s)
 		if s == lastVal {
 			break
@@ -1720,7 +1729,7 @@ func (r *Reader) LabelValueFor(id storage.SeriesRef, label string) (string, erro
 }
 
 // Series reads the series with the given ID and writes its labels and chunks into lbls and chks.
-func (r *Reader) Series(id storage.SeriesRef, lbls *labels.Labels, chks *[]ChunkMeta) (uint64, error) {
+func (r *Reader) Series(id storage.SeriesRef, from int64, through int64, lbls *labels.Labels, chks *[]ChunkMeta) (uint64, error) {
 	offset := id
 	// In version 2 series IDs are no longer exact references but series are 16-byte padded
 	// and the ID is the multiple of 16 of the actual position.
@@ -1732,7 +1741,7 @@ func (r *Reader) Series(id storage.SeriesRef, lbls *labels.Labels, chks *[]Chunk
 		return 0, d.Err()
 	}
 
-	fprint, err := r.dec.Series(d.Get(), lbls, chks)
+	fprint, err := r.dec.Series(d.Get(), id, from, through, lbls, chks)
 	if err != nil {
 		return 0, errors.Wrap(err, "read series")
 	}
@@ -1890,12 +1899,56 @@ func (s *stringListIter) Next() bool {
 func (s stringListIter) At() string { return s.cur }
 func (s stringListIter) Err() error { return nil }
 
+type chunkSample struct {
+	largestMaxt   int64 // holds largest chunk end time we have seen so far. In other words all the earlier chunks have maxt <= largestMaxt
+	idx           int   // index of the chunk in the list which helps with determining position of sampled chunk
+	offset        int   // offset is relative to beginning chunk info block i.e after series labels info and chunk count etc
+	prevChunkMaxt int64 // chunk times are stored as deltas. This is used for calculating mint of sampled chunk
+}
+
+type chunkSamples struct {
+	sync.RWMutex
+	chunks []chunkSample
+}
+
+func newChunkSamples() *chunkSamples {
+	return &chunkSamples{
+		chunks: make([]chunkSample, 0, 30),
+	}
+}
+
+// getChunkSampleForQueryStarting returns back chunk sample which has largest "largestMaxt" that is less than given query start time.
+// In other words, return back chunk sample which skips all the chunks that end before query start time.
+// If query start is before all "largestMaxt", we would return first chunk sample.
+// If query start is after all "largestMaxt", we would return nil.
+func (c *chunkSamples) getChunkSampleForQueryStarting(ts int64) *chunkSample {
+	c.RLock()
+	defer c.RUnlock()
+
+	// first find position of chunk sample which has smallest "largestMaxt" after ts
+	i := sort.Search(len(c.chunks), func(i int) bool {
+		return c.chunks[i].largestMaxt >= ts
+	})
+
+	if i >= len(c.chunks) {
+		return nil
+	}
+
+	// there could be more chunks of interest between this and previous sample, so we should process chunks from previous sample
+	if i > 0 {
+		i--
+	}
+	return &c.chunks[i]
+}
+
 // Decoder provides decoding methods for the v1 and v2 index file format.
 //
 // It currently does not contain decoding methods for all entry types but can be extended
 // by them if there's demand.
 type Decoder struct {
-	LookupSymbol func(uint32) (string, error)
+	LookupSymbol    func(uint32) (string, error)
+	chunksSample    map[storage.SeriesRef]*chunkSamples
+	chunksSampleMtx sync.RWMutex
 }
 
 // Postings returns a postings list for b and its number of elements.
@@ -1964,8 +2017,79 @@ func (dec *Decoder) LabelValueFor(b []byte, label string) (string, error) {
 	return "", d.Err()
 }
 
+func (dec *Decoder) getOrCreateChunksSample(d encoding.Decbuf, seriesRef storage.SeriesRef, numChunks int) (*chunkSamples, error) {
+	dec.chunksSampleMtx.Lock()
+	sample, ok := dec.chunksSample[seriesRef]
+	if ok {
+		dec.chunksSampleMtx.Unlock()
+		return sample, nil
+	}
+
+	sample = newChunkSamples()
+	dec.chunksSample[seriesRef] = sample
+	sample.Lock()
+	defer sample.Unlock()
+
+	dec.chunksSampleMtx.Unlock()
+
+	if err := buildChunkSamples(d, numChunks, sample); err != nil {
+		return nil, err
+	}
+
+	return sample, nil
+}
+
+// buildChunkSamples samples chunks considering maxt of the indexed chunks.
+// It would always sample first and last chunk for returning earlier when query falls out of range on either ends.
+// First chunk onwards it would only sample chunks that have maxt greater by at least 1h than previous sampled chunk's maxt.
+func buildChunkSamples(d encoding.Decbuf, numChunks int, info *chunkSamples) error {
+	bufLen := d.Len()
+
+	chunkPos := bufLen - d.Len()
+	chunkMeta := &ChunkMeta{}
+	if err := readChunkMeta(&d, 0, chunkMeta); err != nil {
+		return errors.Wrapf(d.Err(), "read meta for chunk %d", 0)
+	}
+
+	info.chunks = append(info.chunks, chunkSample{
+		largestMaxt: chunkMeta.MaxTime,
+		idx:         0,
+		offset:      chunkPos,
+	})
+
+	t0 := chunkMeta.MaxTime
+	largestMaxt := chunkMeta.MaxTime
+	prevLargestMaxt := largestMaxt
+
+	for i := 1; i < numChunks; i++ {
+		chunkPos = bufLen - d.Len()
+		if err := readChunkMeta(&d, t0, chunkMeta); err != nil {
+			return errors.Wrapf(d.Err(), "read meta for chunk %d", i)
+		}
+		if chunkMeta.MaxTime > largestMaxt {
+			largestMaxt = chunkMeta.MaxTime
+		}
+
+		if d.Err() != nil {
+			return errors.Wrapf(d.Err(), "read meta for chunk %d", i)
+		}
+
+		if i == numChunks-1 || largestMaxt-prevLargestMaxt >= millisecondsInHour {
+			prevLargestMaxt = largestMaxt
+			info.chunks = append(info.chunks, chunkSample{
+				idx:           i,
+				prevChunkMaxt: t0,
+				largestMaxt:   largestMaxt,
+				offset:        chunkPos,
+			})
+		}
+		t0 = chunkMeta.MaxTime
+	}
+	return d.Err()
+}
+
 // Series decodes a series entry from the given byte slice into lset and chks.
-func (dec *Decoder) Series(b []byte, lbls *labels.Labels, chks *[]ChunkMeta) (uint64, error) {
+func (dec *Decoder) Series(b []byte, seriesRef storage.SeriesRef, from int64, through int64, lbls *labels.Labels, chks *[]ChunkMeta) (uint64, error) {
 	*lbls = (*lbls)[:0]
 	*chks = (*chks)[:0]
 
@@ -2001,46 +2125,64 @@ func (dec *Decoder) Series(b []byte, lbls *labels.Labels, chks *[]ChunkMeta) (ui
 		return 0, d.Err()
 	}
 
-	t0 := d.Varint64()
-	maxt := int64(d.Uvarint64()) + t0
-	kb := uint32(d.Uvarint())
-	entries := uint32(d.Uvarint64())
-	checksum := d.Be32()
+	chunksSample, err := dec.getOrCreateChunksSample(encoding.DecWrap(tsdb_enc.Decbuf{B: d.Get()}), seriesRef, k)
+	if err != nil {
+		return 0, err
+	}
 
-	*chks = append(*chks, ChunkMeta{
-		Checksum: checksum,
-		MinTime:  t0,
-		MaxTime:  maxt,
-		KB:       kb,
-		Entries:  entries,
-	})
-	t0 = maxt
+	cs := chunksSample.getChunkSampleForQueryStarting(from)
+	if cs == nil {
+		return fprint, nil
+	}
+	d.Skip(cs.offset)
 
-	for i := 1; i < k; i++ {
-		// Decode the diff against previous chunk as varint
-		// instead of uvarint because chunks may overlap
-		mint := d.Varint64() + t0
-		maxt := int64(d.Uvarint64()) + mint
-		kb := uint32(d.Uvarint())
-		entries := uint32(d.Uvarint64())
-		checksum := d.Be32()
-		t0 = maxt
+	chunkMeta := &ChunkMeta{}
+	if err := readChunkMeta(&d, cs.prevChunkMaxt, chunkMeta); err != nil {
+		return 0, errors.Wrapf(d.Err(), "read meta for chunk %d", cs.idx)
+	}
 
-		if d.Err() != nil {
-			return 0, errors.Wrapf(d.Err(), "read meta for chunk %d", i)
+	if overlap(from, through, chunkMeta.MinTime, chunkMeta.MaxTime) {
+		*chks = append(*chks, *chunkMeta)
+	}
+	t0 := chunkMeta.MaxTime
+
+	for i := cs.idx + 1; i < k; i++ {
+		if err := readChunkMeta(&d, t0, chunkMeta); err != nil {
+			return 0, errors.Wrapf(d.Err(), "read meta for chunk %d", cs.idx)
 		}
+		t0 = chunkMeta.MaxTime
 
-		*chks = append(*chks, ChunkMeta{
-			Checksum: checksum,
-			MinTime:  mint,
-			MaxTime:  maxt,
-			KB:       kb,
-			Entries:  entries,
-		})
+		if !overlap(from, through, chunkMeta.MinTime, chunkMeta.MaxTime) {
+			continue
+		}
+		if chunkMeta.MinTime >= through {
+			break
+		}
+		*chks = append(*chks, *chunkMeta)
 	}
 	return fprint, d.Err()
 }
 
+func readChunkMeta(d *encoding.Decbuf, prevChunkMaxt int64, chunkMeta *ChunkMeta) error {
+	// Decode the diff against previous chunk as varint
+	// instead of uvarint because chunks may overlap
+	chunkMeta.MinTime = d.Varint64() + prevChunkMaxt
+	chunkMeta.MaxTime = int64(d.Uvarint64()) + chunkMeta.MinTime
+	chunkMeta.KB = uint32(d.Uvarint())
+	chunkMeta.Entries = uint32(d.Uvarint64())
+	chunkMeta.Checksum = d.Be32()
+
+	if d.Err() != nil {
+		return d.Err()
+	}
+
+	return nil
+}
+
 func yoloString(b []byte) string {
 	return *((*string)(unsafe.Pointer(&b)))
+}
+
+func overlap(aFrom, aThrough, bFrom, bThrough int64) bool {
+	return aFrom < bThrough && aThrough > bFrom
 }

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"sort"
 	"strings"
 	"time"
@@ -19,6 +18,7 @@ import (
 	logqllog "github.com/grafana/loki/pkg/logql/log"
 	"github.com/grafana/loki/pkg/util/log"
 	"github.com/grafana/loki/pkg/util/marshal"
+	"github.com/grafana/loki/pkg/util/validation"
 
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/weaveworks/common/user"
@@ -186,8 +186,24 @@ type limiter struct {
 	n int
 }
 
-func (l *limiter) MaxQuerySeries(userID string) int {
+func (l *limiter) MaxQuerySeries(ctx context.Context, userID string) int {
 	return l.n
+}
+
+func (l *limiter) MaxQueryRange(ctx context.Context, userID string) time.Duration {
+	return 0 * time.Second
+}
+
+func (l *limiter) QueryTimeout(ctx context.Context, userID string) time.Duration {
+	return time.Minute * 5
+}
+
+func (l *limiter) BlockedQueries(ctx context.Context, userID string) []*validation.BlockedQuery {
+	return []*validation.BlockedQuery{}
+}
+
+func (l *limiter) RequiredLabels(ctx context.Context, userID string) []string {
+	return nil
 }
 
 type querier struct {
@@ -218,7 +234,7 @@ func newFileIterator(
 ) (iter.EntryIterator, error) {
 
 	lr := io.LimitReader(r, defaultMaxFileSize)
-	b, err := ioutil.ReadAll(lr)
+	b, err := io.ReadAll(lr)
 	if err != nil {
 		return nil, err
 	}

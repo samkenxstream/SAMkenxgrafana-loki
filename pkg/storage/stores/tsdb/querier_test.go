@@ -2,7 +2,9 @@ package tsdb
 
 import (
 	"context"
+	"math"
 	"testing"
+	"time"
 
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
@@ -91,7 +93,7 @@ func TestQueryIndex(t *testing.T) {
 
 	dst, err := b.Build(context.Background(), dir, func(from, through model.Time, checksum uint32) Identifier {
 		id := SingleTenantTSDBIdentifier{
-			Tenant:   "fake",
+			TS:       time.Now(),
 			From:     from,
 			Through:  through,
 			Checksum: checksum,
@@ -112,12 +114,12 @@ func TestQueryIndex(t *testing.T) {
 	)
 
 	require.True(t, p.Next())
-	_, err = reader.Series(p.At(), &ls, &chks)
+	_, err = reader.Series(p.At(), 0, math.MaxInt64, &ls, &chks)
 	require.Nil(t, err)
 	require.Equal(t, cases[0].labels.String(), ls.String())
 	require.Equal(t, cases[0].chunks, chks)
 	require.True(t, p.Next())
-	_, err = reader.Series(p.At(), &ls, &chks)
+	_, err = reader.Series(p.At(), 0, math.MaxInt64, &ls, &chks)
 	require.Nil(t, err)
 	require.Equal(t, cases[1].labels.String(), ls.String())
 	require.Equal(t, cases[1].chunks, chks)

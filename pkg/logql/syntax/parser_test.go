@@ -44,6 +44,15 @@ func TestParse(t *testing.T) {
 			},
 		},
 		{
+			in: `{ foo = "bar" } | decolorize`,
+			exp: newPipelineExpr(
+				newMatcherExpr([]*labels.Matcher{mustNewMatcher(labels.MatchEqual, "foo", "bar")}),
+				MultiStageExpr{
+					newDecolorizeExpr(),
+				},
+			),
+		},
+		{
 			// test [12h] before filter expr
 			in: `count_over_time({foo="bar"}[12h] |= "error")`,
 			exp: &RangeAggregationExpr{
@@ -146,6 +155,16 @@ func TestParse(t *testing.T) {
 				MultiStageExpr{
 					newLabelParserExpr(OpParserTypeLogfmt, ""),
 					newLabelFilterExpr(log.NewStringLabelFilter(mustNewMatcher(labels.MatchEqual, "rate", "a"))),
+				},
+			),
+		},
+		{
+			in: `{ foo = "bar" }|logfmt|length>5d`,
+			exp: newPipelineExpr(
+				newMatcherExpr([]*labels.Matcher{mustNewMatcher(labels.MatchEqual, "foo", "bar")}),
+				MultiStageExpr{
+					newLabelParserExpr(OpParserTypeLogfmt, ""),
+					newLabelFilterExpr(log.NewDurationLabelFilter(log.LabelFilterGreaterThan, "length", 5*24*time.Hour)),
 				},
 			),
 		},
@@ -2845,6 +2864,27 @@ func TestParse(t *testing.T) {
 			err: logqlmodel.NewParseError("syntax error: unexpected IDENTIFIER, expecting NUMBER or { or (", 1, 20),
 		},
 		{
+			in:  `vector(abc)`,
+			err: logqlmodel.NewParseError("syntax error: unexpected IDENTIFIER, expecting NUMBER", 1, 8),
+		},
+		{
+			in:  `vector(1)`,
+			exp: &VectorExpr{Val: 1, err: nil},
+		},
+		{
+			in:  `label_replace(vector(0), "foo", "bar", "", "")`,
+			exp: mustNewLabelReplaceExpr(&VectorExpr{Val: 0, err: nil}, "foo", "bar", "", ""),
+		},
+		{
+			in: `sum(vector(0))`,
+			exp: &VectorAggregationExpr{
+				Left:      &VectorExpr{Val: 0, err: nil},
+				Grouping:  &Grouping{},
+				Params:    0,
+				Operation: "sum",
+			},
+		},
+		{
 			in: `{app="foo"}
 					# |= "bar"
 					| json`,
@@ -2914,8 +2954,8 @@ func TestParse(t *testing.T) {
 			exp: &PipelineExpr{
 				Left: newMatcherExpr([]*labels.Matcher{{Type: labels.MatchEqual, Name: "app", Value: "foo"}}),
 				MultiStages: MultiStageExpr{
-					newJSONExpressionParser([]log.JSONExpression{
-						log.NewJSONExpr("bob", `top.sub["index"]`),
+					newJSONExpressionParser([]log.LabelExtractionExpr{
+						log.NewLabelExtractionExpr("bob", `top.sub["index"]`),
 					}),
 				},
 			},
@@ -2925,8 +2965,8 @@ func TestParse(t *testing.T) {
 			exp: &PipelineExpr{
 				Left: newMatcherExpr([]*labels.Matcher{{Type: labels.MatchEqual, Name: "app", Value: "foo"}}),
 				MultiStages: MultiStageExpr{
-					newJSONExpressionParser([]log.JSONExpression{
-						log.NewJSONExpr("bob", `top.params[0]`),
+					newJSONExpressionParser([]log.LabelExtractionExpr{
+						log.NewLabelExtractionExpr("bob", `top.params[0]`),
 					}),
 				},
 			},
@@ -2936,21 +2976,124 @@ func TestParse(t *testing.T) {
 			exp: &PipelineExpr{
 				Left: newMatcherExpr([]*labels.Matcher{{Type: labels.MatchEqual, Name: "app", Value: "foo"}}),
 				MultiStages: MultiStageExpr{
-					newJSONExpressionParser([]log.JSONExpression{
-						log.NewJSONExpr("response_code", `response.code`),
-						log.NewJSONExpr("api_key", `request.headers["X-API-KEY"]`),
+					newJSONExpressionParser([]log.LabelExtractionExpr{
+						log.NewLabelExtractionExpr("response_code", `response.code`),
+						log.NewLabelExtractionExpr("api_key", `request.headers["X-API-KEY"]`),
 					}),
 				},
 			},
 		},
 		{
-			in: `{app="foo"} | json response_code, api_key="request.headers[\"X-API-KEY\"]"`,
+			in: `{app="foo"} | json response_code, api_key="request.headers[\"X-API-KEY\"]", layer7_something_specific="layer7_something_specific"`,
 			exp: &PipelineExpr{
 				Left: newMatcherExpr([]*labels.Matcher{{Type: labels.MatchEqual, Name: "app", Value: "foo"}}),
 				MultiStages: MultiStageExpr{
-					newJSONExpressionParser([]log.JSONExpression{
-						log.NewJSONExpr("response_code", `response_code`),
-						log.NewJSONExpr("api_key", `request.headers["X-API-KEY"]`),
+					newJSONExpressionParser([]log.LabelExtractionExpr{
+						log.NewLabelExtractionExpr("response_code", `response_code`),
+						log.NewLabelExtractionExpr("api_key", `request.headers["X-API-KEY"]`),
+						log.NewLabelExtractionExpr("layer7_something_specific", `layer7_something_specific`),
+					}),
+				},
+			},
+		},
+		{
+			in: `count_over_time({ foo ="bar" } | json layer7_something_specific="layer7_something_specific" [12m])`,
+			exp: &RangeAggregationExpr{
+				Left: &LogRange{
+					Left: &PipelineExpr{
+						MultiStages: MultiStageExpr{
+							newJSONExpressionParser([]log.LabelExtractionExpr{
+								log.NewLabelExtractionExpr("layer7_something_specific", `layer7_something_specific`),
+							}),
+						},
+						Left: &MatchersExpr{Mts: []*labels.Matcher{mustNewMatcher(labels.MatchEqual, "foo", "bar")}},
+					},
+					Interval: 12 * time.Minute,
+				},
+				Operation: "count_over_time",
+			},
+		},
+		{
+			// binop always includes vector matching. Default is `without ()`,
+			// the zero value.
+			in: `
+			sum(count_over_time({foo="bar"}[5m])) or vector(1)
+			`,
+			exp: mustNewBinOpExpr(
+				OpTypeOr,
+				&BinOpOptions{
+					VectorMatching: &VectorMatching{Card: CardOneToOne},
+				},
+				mustNewVectorAggregationExpr(newRangeAggregationExpr(
+					&LogRange{
+						Left: &MatchersExpr{
+							Mts: []*labels.Matcher{
+								mustNewMatcher(labels.MatchEqual, "foo", "bar"),
+							},
+						},
+						Interval: 5 * time.Minute,
+					}, OpRangeTypeCount, nil, nil),
+					"sum",
+					&Grouping{},
+					nil,
+				),
+				NewVectorExpr("1"),
+			),
+		},
+		{
+			in: `{app="foo"} | logfmt message="msg"`,
+			exp: &PipelineExpr{
+				Left: newMatcherExpr([]*labels.Matcher{{Type: labels.MatchEqual, Name: "app", Value: "foo"}}),
+				MultiStages: MultiStageExpr{
+					newLogfmtExpressionParser([]log.LabelExtractionExpr{
+						log.NewLabelExtractionExpr("message", `msg`),
+					}),
+				},
+			},
+		},
+		{
+			in: `{app="foo"} | logfmt msg`,
+			exp: &PipelineExpr{
+				Left: newMatcherExpr([]*labels.Matcher{{Type: labels.MatchEqual, Name: "app", Value: "foo"}}),
+				MultiStages: MultiStageExpr{
+					newLogfmtExpressionParser([]log.LabelExtractionExpr{
+						log.NewLabelExtractionExpr("msg", `msg`),
+					}),
+				},
+			},
+		},
+		{
+			in: `{app="foo"} | logfmt msg, err `,
+			exp: &PipelineExpr{
+				Left: newMatcherExpr([]*labels.Matcher{{Type: labels.MatchEqual, Name: "app", Value: "foo"}}),
+				MultiStages: MultiStageExpr{
+					newLogfmtExpressionParser([]log.LabelExtractionExpr{
+						log.NewLabelExtractionExpr("msg", `msg`),
+						log.NewLabelExtractionExpr("err", `err`),
+					}),
+				},
+			},
+		},
+		{
+			in: `{app="foo"} | logfmt msg, err="error"`,
+			exp: &PipelineExpr{
+				Left: newMatcherExpr([]*labels.Matcher{{Type: labels.MatchEqual, Name: "app", Value: "foo"}}),
+				MultiStages: MultiStageExpr{
+					newLogfmtExpressionParser([]log.LabelExtractionExpr{
+						log.NewLabelExtractionExpr("msg", `msg`),
+						log.NewLabelExtractionExpr("err", `error`),
+					}),
+				},
+			},
+		},
+		{
+			in: `{app="foo"} | logfmt msg="message", apiKey="api_key"`,
+			exp: &PipelineExpr{
+				Left: newMatcherExpr([]*labels.Matcher{{Type: labels.MatchEqual, Name: "app", Value: "foo"}}),
+				MultiStages: MultiStageExpr{
+					newLogfmtExpressionParser([]log.LabelExtractionExpr{
+						log.NewLabelExtractionExpr("msg", `message`),
+						log.NewLabelExtractionExpr("apiKey", `api_key`),
 					}),
 				},
 			},
@@ -3060,6 +3203,65 @@ func Test_PipelineCombined(t *testing.T) {
 		lbs.Labels(),
 	)
 	require.Equal(t, string([]byte(`1.5s|POST|200`)), string(line))
+}
+
+func Benchmark_PipelineCombined(b *testing.B) {
+	query := `{job="cortex-ops/query-frontend"} |= "logging.go" | logfmt | line_format "{{.msg}}" | regexp "(?P<method>\\w+) (?P<path>[\\w|/]+) \\((?P<status>\\d+?)\\) (?P<duration>.*)" | (duration > 1s or status==200) and method="POST" | line_format "{{.duration}}|{{.method}}|{{.status}}"`
+
+	expr, err := ParseLogSelector(query, true)
+	require.Nil(b, err)
+
+	p, err := expr.Pipeline()
+	require.Nil(b, err)
+	sp := p.ForStream(labels.Labels{})
+	var (
+		line    []byte
+		lbs     log.LabelsResult
+		matches bool
+	)
+	in := []byte(`level=debug ts=2020-10-02T10:10:42.092268913Z caller=logging.go:66 traceID=a9d4d8a928d8db1 msg="POST /api/prom/api/v1/query_range (200) 1.5s"`)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		line, lbs, matches = sp.Process(0, in)
+	}
+	require.True(b, matches)
+	require.Equal(
+		b,
+		labels.Labels{labels.Label{Name: "caller", Value: "logging.go:66"}, labels.Label{Name: "duration", Value: "1.5s"}, labels.Label{Name: "level", Value: "debug"}, labels.Label{Name: "method", Value: "POST"}, labels.Label{Name: "msg", Value: "POST /api/prom/api/v1/query_range (200) 1.5s"}, labels.Label{Name: "path", Value: "/api/prom/api/v1/query_range"}, labels.Label{Name: "status", Value: "200"}, labels.Label{Name: "traceID", Value: "a9d4d8a928d8db1"}, labels.Label{Name: "ts", Value: "2020-10-02T10:10:42.092268913Z"}},
+		lbs.Labels(),
+	)
+	require.Equal(b, string([]byte(`1.5s|POST|200`)), string(line))
+}
+
+func Benchmark_MetricPipelineCombined(b *testing.B) {
+	query := `count_over_time({job="cortex-ops/query-frontend"} |= "logging.go" | logfmt | line_format "{{.msg}}" | regexp "(?P<method>\\w+) (?P<path>[\\w|/]+) \\((?P<status>\\d+?)\\) (?P<duration>.*)" | (duration > 1s or status==200) and method="POST" | line_format "{{.duration}}|{{.method}}|{{.status}}"[1m])`
+
+	expr, err := ParseSampleExpr(query)
+	require.Nil(b, err)
+
+	p, err := expr.Extractor()
+	require.Nil(b, err)
+	sp := p.ForStream(labels.Labels{})
+	var (
+		v       float64
+		lbs     log.LabelsResult
+		matches bool
+	)
+	in := []byte(`level=debug ts=2020-10-02T10:10:42.092268913Z caller=logging.go:66 traceID=a9d4d8a928d8db1 msg="POST /api/prom/api/v1/query_range (200) 1.5s"`)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		v, lbs, matches = sp.Process(0, in)
+	}
+	require.True(b, matches)
+	require.Equal(
+		b,
+		labels.Labels{labels.Label{Name: "caller", Value: "logging.go:66"}, labels.Label{Name: "duration", Value: "1.5s"}, labels.Label{Name: "level", Value: "debug"}, labels.Label{Name: "method", Value: "POST"}, labels.Label{Name: "msg", Value: "POST /api/prom/api/v1/query_range (200) 1.5s"}, labels.Label{Name: "path", Value: "/api/prom/api/v1/query_range"}, labels.Label{Name: "status", Value: "200"}, labels.Label{Name: "traceID", Value: "a9d4d8a928d8db1"}, labels.Label{Name: "ts", Value: "2020-10-02T10:10:42.092268913Z"}},
+		lbs.Labels(),
+	)
+	require.Equal(b, 1.0, v)
 }
 
 var c []*labels.Matcher
@@ -3182,4 +3384,39 @@ func TestParseLogSelectorExpr_equalityMatcher(t *testing.T) {
 			require.Equal(t, tc.err, err)
 		})
 	}
+}
+
+func TestParseLabels(t *testing.T) {
+	for _, tc := range []struct {
+		desc   string
+		input  string
+		output labels.Labels
+	}{
+		{
+			desc:   "basic",
+			input:  `{job="foo"}`,
+			output: []labels.Label{{Name: "job", Value: "foo"}},
+		},
+		{
+			desc:   "strip empty label value",
+			input:  `{job="foo", bar=""}`,
+			output: []labels.Label{{Name: "job", Value: "foo"}},
+		},
+	} {
+		t.Run(tc.desc, func(t *testing.T) {
+			got, _ := ParseLabels(tc.input)
+			require.Equal(t, tc.output, got)
+		})
+	}
+}
+
+func TestNoOpLabelToString(t *testing.T) {
+	logExpr := `{container_name="app"} | foo=~".*"`
+	l, err := ParseLogSelector(logExpr, false)
+	require.NoError(t, err)
+	require.Equal(t, `{container_name="app"} | foo=~"(?-s:.)*?"`, l.String())
+
+	stages, err := l.(*PipelineExpr).MultiStages.stages()
+	require.NoError(t, err)
+	require.Len(t, stages, 0)
 }

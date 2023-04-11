@@ -2,8 +2,10 @@ package tsdb
 
 import (
 	"context"
+	"math/rand"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/go-kit/log"
 	"github.com/prometheus/common/model"
@@ -64,7 +66,7 @@ func TestSingleIdx(t *testing.T) {
 		{
 			desc: "file",
 			fn: func() Index {
-				return BuildIndex(t, t.TempDir(), "fake", cases)
+				return BuildIndex(t, t.TempDir(), cases)
 			},
 		},
 		{
@@ -72,7 +74,7 @@ func TestSingleIdx(t *testing.T) {
 			fn: func() Index {
 				head := NewHead("fake", NewMetrics(nil), log.NewNopLogger())
 				for _, x := range cases {
-					_, _ = head.Append(x.Labels, x.Chunks)
+					_, _ = head.Append(x.Labels, x.Labels.Hash(), x.Chunks)
 				}
 				reader := head.Index()
 				return NewTSDBIndex(reader)
@@ -200,4 +202,55 @@ func TestSingleIdx(t *testing.T) {
 		})
 	}
 
+}
+
+func BenchmarkTSDBIndex_GetChunkRefs(b *testing.B) {
+	now := model.Now()
+	queryFrom, queryThrough := now.Add(3*time.Hour).Add(time.Millisecond), now.Add(5*time.Hour).Add(-time.Millisecond)
+	queryBounds := newBounds(queryFrom, queryThrough)
+	numChunksToMatch := 0
+
+	var chunkMetas []index.ChunkMeta
+	// build a chunk for every second with randomized chunk length
+	for from, through := now, now.Add(24*time.Hour); from <= through; from = from.Add(time.Second) {
+		// randomize chunk length between 1-120 mins
+		chunkLenMin := rand.Intn(120)
+		if chunkLenMin == 0 {
+			chunkLenMin = 1
+		}
+		chunkMeta := index.ChunkMeta{
+			MinTime:  int64(from),
+			MaxTime:  int64(from.Add(time.Duration(chunkLenMin) * time.Minute)),
+			Checksum: uint32(from),
+			Entries:  1,
+		}
+		chunkMetas = append(chunkMetas, chunkMeta)
+		if Overlap(chunkMeta, queryBounds) {
+			numChunksToMatch++
+		}
+	}
+
+	tempDir := b.TempDir()
+	tsdbIndex := BuildIndex(b, tempDir, []LoadableSeries{
+		{
+			Labels: mustParseLabels(`{foo="bar", fizz="buzz"}`),
+			Chunks: chunkMetas,
+		},
+		{
+			Labels: mustParseLabels(`{foo="bar", ping="pong"}`),
+			Chunks: chunkMetas,
+		},
+		{
+			Labels: mustParseLabels(`{foo1="bar1", ping="pong"}`),
+			Chunks: chunkMetas,
+		},
+	})
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		chkRefs, err := tsdbIndex.GetChunkRefs(context.Background(), "fake", queryFrom, queryThrough, nil, nil, labels.MustNewMatcher(labels.MatchEqual, "foo", "bar"))
+		require.NoError(b, err)
+		require.Len(b, chkRefs, numChunksToMatch*2)
+	}
 }

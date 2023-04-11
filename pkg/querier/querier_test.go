@@ -8,8 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/grafana/loki/pkg/storage/stores/shipper/compactor/deletion"
-
 	"github.com/grafana/dskit/flagext"
 	"github.com/grafana/dskit/ring"
 	ring_client "github.com/grafana/dskit/ring/client"
@@ -24,6 +22,7 @@ import (
 	"github.com/grafana/loki/pkg/logproto"
 	"github.com/grafana/loki/pkg/logql"
 	"github.com/grafana/loki/pkg/storage"
+	"github.com/grafana/loki/pkg/storage/stores/indexshipper/compactor/deletion"
 	"github.com/grafana/loki/pkg/validation"
 )
 
@@ -48,8 +47,9 @@ func TestQuerier_Label_QueryTimeoutConfigFlag(t *testing.T) {
 
 	store := newStoreMock()
 	store.On("LabelValuesForMetricName", mock.Anything, "test", model.TimeFromUnixNano(startTime.UnixNano()), model.TimeFromUnixNano(endTime.UnixNano()), "logs", "test").Return([]string{"foo", "bar"}, nil)
-
-	limits, err := validation.NewOverrides(defaultLimitsTestConfig(), nil)
+	limitsCfg := defaultLimitsTestConfig()
+	limitsCfg.QueryTimeout = model.Duration(queryTimeout)
+	limits, err := validation.NewOverrides(limitsCfg, nil)
 	require.NoError(t, err)
 
 	q, err := newQuerier(
@@ -102,7 +102,9 @@ func TestQuerier_Tail_QueryTimeoutConfigFlag(t *testing.T) {
 	ingesterClient.On("Tail", mock.Anything, &request, mock.Anything).Return(tailClient, nil)
 	ingesterClient.On("TailersCount", mock.Anything, mock.Anything, mock.Anything).Return(&logproto.TailersCountResponse{}, nil)
 
-	limits, err := validation.NewOverrides(defaultLimitsTestConfig(), nil)
+	limitsCfg := defaultLimitsTestConfig()
+	limitsCfg.QueryTimeout = model.Duration(queryTimeout)
+	limits, err := validation.NewOverrides(limitsCfg, nil)
 	require.NoError(t, err)
 
 	q, err := newQuerier(
@@ -141,7 +143,6 @@ func TestQuerier_Tail_QueryTimeoutConfigFlag(t *testing.T) {
 func mockQuerierConfig() Config {
 	return Config{
 		TailMaxDuration: 1 * time.Minute,
-		QueryTimeout:    queryTimeout,
 	}
 }
 
@@ -206,9 +207,9 @@ func TestQuerier_validateQueryRequest(t *testing.T) {
 	_, err = q.SelectLogs(ctx, logql.SelectLogParams{QueryRequest: &request})
 	require.NoError(t, err)
 
-	request.Start = request.End.Add(-3 * time.Minute)
+	request.Start = request.End.Add(-3*time.Minute - 2*time.Second)
 	_, err = q.SelectLogs(ctx, logql.SelectLogParams{QueryRequest: &request})
-	require.Equal(t, httpgrpc.Errorf(http.StatusBadRequest, "the query time range exceeds the limit (query length: 3m0s, limit: 2m0s)"), err)
+	require.Equal(t, httpgrpc.Errorf(http.StatusBadRequest, "the query time range exceeds the limit (query length: 3m2s, limit: 2m)"), err)
 }
 
 func TestQuerier_SeriesAPI(t *testing.T) {
@@ -504,7 +505,7 @@ func TestQuerier_concurrentTailLimits(t *testing.T) {
 				mockQuerierConfig(),
 				mockIngesterClientConfig(),
 				newIngesterClientMockFactory(ingesterClient),
-				newReadRingMock(testData.ringIngesters),
+				newReadRingMock(testData.ringIngesters, 0),
 				&mockDeleteGettter{},
 				store, limits)
 			require.NoError(t, err)
@@ -1013,8 +1014,12 @@ type fakeTimeLimits struct {
 	maxQueryLength   time.Duration
 }
 
-func (f fakeTimeLimits) MaxQueryLookback(_ string) time.Duration { return f.maxQueryLookback }
-func (f fakeTimeLimits) MaxQueryLength(_ string) time.Duration   { return f.maxQueryLength }
+func (f fakeTimeLimits) MaxQueryLookback(_ context.Context, _ string) time.Duration {
+	return f.maxQueryLookback
+}
+func (f fakeTimeLimits) MaxQueryLength(_ context.Context, _ string) time.Duration {
+	return f.maxQueryLength
+}
 
 func Test_validateQueryTimeRangeLimits(t *testing.T) {
 	now := time.Now()

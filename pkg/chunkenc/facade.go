@@ -2,6 +2,7 @@ package chunkenc
 
 import (
 	"io"
+	"time"
 
 	"github.com/prometheus/common/model"
 
@@ -40,6 +41,10 @@ func NewFacade(c Chunk, blockSize, targetSize int) chunk.Data {
 		blockSize:  blockSize,
 		targetSize: targetSize,
 	}
+}
+
+func (f Facade) Bounds() (time.Time, time.Time) {
+	return f.c.Bounds()
 }
 
 // Marshal implements chunk.Chunk.
@@ -82,6 +87,13 @@ func (f Facade) Size() int {
 	}
 	// Note this is an estimation (which is OK)
 	return f.c.CompressedSize()
+}
+
+func (f Facade) UncompressedSize() int {
+	if f.c == nil {
+		return 0
+	}
+	return f.c.UncompressedSize()
 }
 
 func (f Facade) Entries() int {

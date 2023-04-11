@@ -1,3 +1,9 @@
+variable "name" {
+  type        = string
+  description = "Name used for created AWS resources."
+  default     = "lambda_promtail"
+}
+
 variable "write_address" {
   type        = string
   description = "This is the Loki Write API compatible endpoint that you want to write logs to, either promtail or Loki."
@@ -5,13 +11,13 @@ variable "write_address" {
 }
 
 variable "bucket_names" {
-  type        = list(string)
+  type        = set(string)
   description = "List of S3 bucket names to create Event Notifications for."
   default     = []
 }
 
 variable "log_group_names" {
-  type        = list(string)
+  type        = set(string)
   description = "List of CloudWatch Log Group names to create Subscription Filters for."
   default     = []
 }
@@ -35,6 +41,13 @@ variable "password" {
   default     = ""
 }
 
+variable "bearer_token" {
+  type        = string
+  description = "The bearer token, necessary if target endpoint requires it."
+  sensitive   = true
+  default     = ""
+}
+
 variable "tenant_id" {
   type        = string
   description = "Tenant ID to be added when writing logs from lambda-promtail."
@@ -47,10 +60,22 @@ variable "keep_stream" {
   default     = "false"
 }
 
-variable "extra_labels"{
-  type = string
+variable "print_log_line" {
+  type        = string
+  description = "Determines whether we want the lambda to output the parsed log line before sending it on to promtail. Value needed to disable is the string 'false'"
+  default     = "true"
+}
+
+variable "extra_labels" {
+  type        = string
   description = "Comma separated list of extra labels, in the format 'name1,value1,name2,value2,...,nameN,valueN' to add to entries forwarded by lambda-promtail."
-  default = ""
+  default     = ""
+}
+
+variable "omit_extra_labels_prefix" {
+  type        = bool
+  description = "Whether or not to omit the prefix `__extra_` from extra labels defined in the variable `extra_labels`."
+  default     = false
 }
 
 variable "batch_size" {
@@ -62,11 +87,29 @@ variable "batch_size" {
 variable "lambda_vpc_subnets" {
   type        = list(string)
   description = "List of subnet IDs associated with the Lambda function."
-  default     = [""]
+  default     = []
 }
 
 variable "lambda_vpc_security_groups" {
   type        = list(string)
   description = "List of security group IDs associated with the Lambda function."
-  default     = [""]
+  default     = []
+}
+
+variable "kms_key_arn" {
+  type        = string
+  description = "kms key arn for encrypting env vars."
+  default     = ""
+}
+
+variable "skip_tls_verify" {
+  type        = string
+  description = "Determines whether to verify the TLS certificate"
+  default     = "false"
+}
+
+variable "kinesis_stream_name" {
+  type        = set(string)
+  description = "Enter kinesis name if kinesis stream is configured as event source in lambda."
+  default     = []
 }

@@ -1,12 +1,11 @@
-//go:build linux && cgo
-// +build linux,cgo
+//go:build linux && cgo && promtail_journal_enabled
+// +build linux,cgo,promtail_journal_enabled
 
 package journal
 
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"strings"
 	"syscall"
 	"time"
@@ -90,6 +89,7 @@ var defaultJournalEntryFunc = func(c sdjournal.JournalReaderConfig, cursor strin
 // JournalTarget tails systemd journal entries.
 // nolint
 type JournalTarget struct {
+	metrics       *Metrics
 	logger        log.Logger
 	handler       api.EntryHandler
 	positions     positions.Positions
@@ -104,6 +104,7 @@ type JournalTarget struct {
 
 // NewJournalTarget configures a new JournalTarget.
 func NewJournalTarget(
+	metrics *Metrics,
 	logger log.Logger,
 	handler api.EntryHandler,
 	positions positions.Positions,
@@ -113,6 +114,7 @@ func NewJournalTarget(
 ) (*JournalTarget, error) {
 
 	return journalTargetWithReader(
+		metrics,
 		logger,
 		handler,
 		positions,
@@ -125,6 +127,7 @@ func NewJournalTarget(
 }
 
 func journalTargetWithReader(
+	metrics *Metrics,
 	logger log.Logger,
 	handler api.EntryHandler,
 	pos positions.Positions,
@@ -147,6 +150,7 @@ func journalTargetWithReader(
 
 	until := make(chan time.Time)
 	t := &JournalTarget{
+		metrics:       metrics,
 		logger:        logger,
 		handler:       handler,
 		positions:     pos,
@@ -169,12 +173,26 @@ func journalTargetWithReader(
 		return nil, errors.Wrap(err, "parsing journal reader 'max_age' config value")
 	}
 
-	cfg := t.generateJournalConfig(journalConfigBuilder{
+	cb := journalConfigBuilder{
 		JournalPath: targetConfig.Path,
 		Position:    position,
 		MaxAge:      maxAge,
 		EntryFunc:   entryFunc,
-	})
+	}
+
+	matches := strings.Fields(targetConfig.Matches)
+	for _, m := range matches {
+		fv := strings.Split(m, "=")
+		if len(fv) != 2 {
+			return nil, errors.New("Error parsing journal reader 'matches' config value")
+		}
+		cb.Matches = append(cb.Matches, sdjournal.Match{
+			Field: fv[0],
+			Value: fv[1],
+		})
+	}
+
+	cfg := t.generateJournalConfig(cb)
 	t.r, err = readerFunc(cfg)
 	if err != nil {
 		return nil, errors.Wrap(err, "creating journal reader")
@@ -182,14 +200,18 @@ func journalTargetWithReader(
 
 	go func() {
 		for {
-			err := t.r.Follow(until, ioutil.Discard)
+			err := t.r.Follow(until, io.Discard)
 			if err != nil {
-				level.Error(t.logger).Log("msg", "received error during sdjournal follow", "err", err.Error())
+				if err == sdjournal.ErrExpired {
+					return
+				}
 
-				if err == sdjournal.ErrExpired || err == syscall.EBADMSG || err == io.EOF {
+				if err == syscall.EBADMSG || err == io.EOF {
 					level.Error(t.logger).Log("msg", "unable to follow journal", "err", err.Error())
 					return
 				}
+
+				level.Error(t.logger).Log("msg", "received unexpected error while following the journal", "err", err.Error())
 			}
 
 			// prevent tight loop
@@ -203,6 +225,7 @@ func journalTargetWithReader(
 type journalConfigBuilder struct {
 	JournalPath string
 	Position    string
+	Matches     []sdjournal.Match
 	MaxAge      time.Duration
 	EntryFunc   journalEntryFunc
 }
@@ -216,6 +239,7 @@ func (t *JournalTarget) generateJournalConfig(
 
 	cfg := sdjournal.JournalReaderConfig{
 		Path:      cb.JournalPath,
+		Matches:   cb.Matches,
 		Formatter: t.formatter,
 	}
 
@@ -263,7 +287,7 @@ func (t *JournalTarget) formatter(entry *sdjournal.JournalEntry) (string, error)
 
 		bb, err := json.Marshal(entry.Fields)
 		if err != nil {
-			level.Error(t.logger).Log("msg", "could not marshal journal fields to JSON", "err", err)
+			level.Error(t.logger).Log("msg", "could not marshal journal fields to JSON", "err", err, "unit", entry.Fields["_SYSTEMD_UNIT"])
 			return journalEmptyStr, nil
 		}
 		msg = string(bb)
@@ -271,7 +295,8 @@ func (t *JournalTarget) formatter(entry *sdjournal.JournalEntry) (string, error)
 		var ok bool
 		msg, ok = entry.Fields["MESSAGE"]
 		if !ok {
-			level.Debug(t.logger).Log("msg", "received journal entry with no MESSAGE field")
+			level.Debug(t.logger).Log("msg", "received journal entry with no MESSAGE field", "unit", entry.Fields["_SYSTEMD_UNIT"])
+			t.metrics.journalErrors.WithLabelValues(noMessageError).Inc()
 			return journalEmptyStr, nil
 		}
 	}
@@ -283,7 +308,7 @@ func (t *JournalTarget) formatter(entry *sdjournal.JournalEntry) (string, error)
 		entryLabels[string(k)] = string(v)
 	}
 
-	processedLabels := relabel.Process(labels.FromMap(entryLabels), t.relabelConfig...)
+	processedLabels, _ := relabel.Process(labels.FromMap(entryLabels), t.relabelConfig...)
 
 	processedLabelsMap := processedLabels.Map()
 	labels := make(model.LabelSet, len(processedLabelsMap))
@@ -296,9 +321,12 @@ func (t *JournalTarget) formatter(entry *sdjournal.JournalEntry) (string, error)
 	}
 	if len(labels) == 0 {
 		// No labels, drop journal entry
+		level.Debug(t.logger).Log("msg", "received journal entry with no labels", "unit", entry.Fields["_SYSTEMD_UNIT"])
+		t.metrics.journalErrors.WithLabelValues(emptyLabelsError).Inc()
 		return journalEmptyStr, nil
 	}
 
+	t.metrics.journalLines.Inc()
 	t.positions.PutString(t.positionPath, entry.Cursor)
 	t.handler.Chan() <- api.Entry{
 		Labels: labels,

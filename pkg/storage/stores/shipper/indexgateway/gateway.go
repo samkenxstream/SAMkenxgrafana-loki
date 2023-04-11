@@ -2,11 +2,13 @@ package indexgateway
 
 import (
 	"context"
+	"fmt"
 	"sync"
 
 	"github.com/go-kit/log"
 	"github.com/grafana/dskit/services"
 	"github.com/grafana/dskit/tenant"
+	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
@@ -15,8 +17,8 @@ import (
 	"github.com/grafana/loki/pkg/logql/syntax"
 	"github.com/grafana/loki/pkg/storage/chunk"
 	"github.com/grafana/loki/pkg/storage/chunk/fetcher"
+	"github.com/grafana/loki/pkg/storage/stores/index/stats"
 	"github.com/grafana/loki/pkg/storage/stores/series/index"
-	"github.com/grafana/loki/pkg/storage/stores/shipper/indexgateway/indexgatewaypb"
 	"github.com/grafana/loki/pkg/storage/stores/shipper/util"
 )
 
@@ -29,6 +31,7 @@ type IndexQuerier interface {
 	GetSeries(ctx context.Context, userID string, from, through model.Time, matchers ...*labels.Matcher) ([]labels.Labels, error)
 	LabelValuesForMetricName(ctx context.Context, userID string, from, through model.Time, metricName string, labelName string, matchers ...*labels.Matcher) ([]string, error)
 	LabelNamesForMetricName(ctx context.Context, userID string, from, through model.Time, metricName string) ([]string, error)
+	Stats(ctx context.Context, userID string, from, through model.Time, matchers ...*labels.Matcher) (*stats.Stats, error)
 	Stop()
 }
 
@@ -54,6 +57,9 @@ type Gateway struct {
 // In case it is configured to be in ring mode, a Basic Service wrapping the ring client is started.
 // Otherwise, it starts an Idle Service that doesn't have lifecycle hooks.
 func NewIndexGateway(cfg Config, log log.Logger, registerer prometheus.Registerer, indexQuerier IndexQuerier, indexClient IndexClient) (*Gateway, error) {
+	if indexClient == nil {
+		indexClient = failingIndexClient{}
+	}
 	g := &Gateway{
 		indexQuerier: indexQuerier,
 		cfg:          cfg,
@@ -70,7 +76,7 @@ func NewIndexGateway(cfg Config, log log.Logger, registerer prometheus.Registere
 	return g, nil
 }
 
-func (g *Gateway) QueryIndex(request *indexgatewaypb.QueryIndexRequest, server indexgatewaypb.IndexGateway_QueryIndexServer) error {
+func (g *Gateway) QueryIndex(request *logproto.QueryIndexRequest, server logproto.IndexGateway_QueryIndexServer) error {
 	var outerErr error
 	var innerErr error
 
@@ -87,7 +93,7 @@ func (g *Gateway) QueryIndex(request *indexgatewaypb.QueryIndexRequest, server i
 
 	sendBatchMtx := sync.Mutex{}
 	outerErr = g.indexClient.QueryPages(server.Context(), queries, func(query index.Query, batch index.ReadBatchResult) bool {
-		innerErr = buildResponses(query, batch, func(response *indexgatewaypb.QueryIndexResponse) error {
+		innerErr = buildResponses(query, batch, func(response *logproto.QueryIndexResponse) error {
 			// do not send grpc responses concurrently. See https://github.com/grpc/grpc-go/blob/master/stream.go#L120-L123.
 			sendBatchMtx.Lock()
 			defer sendBatchMtx.Unlock()
@@ -109,30 +115,30 @@ func (g *Gateway) QueryIndex(request *indexgatewaypb.QueryIndexRequest, server i
 	return outerErr
 }
 
-func buildResponses(query index.Query, batch index.ReadBatchResult, callback func(*indexgatewaypb.QueryIndexResponse) error) error {
+func buildResponses(query index.Query, batch index.ReadBatchResult, callback func(*logproto.QueryIndexResponse) error) error {
 	itr := batch.Iterator()
-	var resp []*indexgatewaypb.Row
+	var resp []*logproto.Row
 
 	for itr.Next() {
 		if len(resp) == maxIndexEntriesPerResponse {
-			err := callback(&indexgatewaypb.QueryIndexResponse{
+			err := callback(&logproto.QueryIndexResponse{
 				QueryKey: util.QueryKey(query),
 				Rows:     resp,
 			})
 			if err != nil {
 				return err
 			}
-			resp = []*indexgatewaypb.Row{}
+			resp = []*logproto.Row{}
 		}
 
-		resp = append(resp, &indexgatewaypb.Row{
+		resp = append(resp, &logproto.Row{
 			RangeValue: itr.RangeValue(),
 			Value:      itr.Value(),
 		})
 	}
 
 	if len(resp) != 0 {
-		err := callback(&indexgatewaypb.QueryIndexResponse{
+		err := callback(&logproto.QueryIndexResponse{
 			QueryKey: util.QueryKey(query),
 			Rows:     resp,
 		})
@@ -144,7 +150,7 @@ func buildResponses(query index.Query, batch index.ReadBatchResult, callback fun
 	return nil
 }
 
-func (g *Gateway) GetChunkRef(ctx context.Context, req *indexgatewaypb.GetChunkRefRequest) (*indexgatewaypb.GetChunkRefResponse, error) {
+func (g *Gateway) GetChunkRef(ctx context.Context, req *logproto.GetChunkRefRequest) (*logproto.GetChunkRefResponse, error) {
 	instanceID, err := tenant.TenantID(ctx)
 	if err != nil {
 		return nil, err
@@ -157,7 +163,7 @@ func (g *Gateway) GetChunkRef(ctx context.Context, req *indexgatewaypb.GetChunkR
 	if err != nil {
 		return nil, err
 	}
-	result := &indexgatewaypb.GetChunkRefResponse{
+	result := &logproto.GetChunkRefResponse{
 		Refs: make([]*logproto.ChunkRef, 0, len(chunks)),
 	}
 	for _, cs := range chunks {
@@ -168,7 +174,7 @@ func (g *Gateway) GetChunkRef(ctx context.Context, req *indexgatewaypb.GetChunkR
 	return result, nil
 }
 
-func (g *Gateway) GetSeries(ctx context.Context, req *indexgatewaypb.GetSeriesRequest) (*indexgatewaypb.GetSeriesResponse, error) {
+func (g *Gateway) GetSeries(ctx context.Context, req *logproto.GetSeriesRequest) (*logproto.GetSeriesResponse, error) {
 	instanceID, err := tenant.TenantID(ctx)
 	if err != nil {
 		return nil, err
@@ -183,18 +189,18 @@ func (g *Gateway) GetSeries(ctx context.Context, req *indexgatewaypb.GetSeriesRe
 		return nil, err
 	}
 
-	resp := &indexgatewaypb.GetSeriesResponse{
-		Series: make([]indexgatewaypb.Series, len(series)),
+	resp := &logproto.GetSeriesResponse{
+		Series: make([]logproto.IndexSeries, len(series)),
 	}
 	for i := range series {
-		resp.Series[i] = indexgatewaypb.Series{
+		resp.Series[i] = logproto.IndexSeries{
 			Labels: logproto.FromLabelsToLabelAdapters(series[i]),
 		}
 	}
 	return resp, nil
 }
 
-func (g *Gateway) LabelNamesForMetricName(ctx context.Context, req *indexgatewaypb.LabelNamesForMetricNameRequest) (*indexgatewaypb.LabelResponse, error) {
+func (g *Gateway) LabelNamesForMetricName(ctx context.Context, req *logproto.LabelNamesForMetricNameRequest) (*logproto.LabelResponse, error) {
 	instanceID, err := tenant.TenantID(ctx)
 	if err != nil {
 		return nil, err
@@ -203,12 +209,12 @@ func (g *Gateway) LabelNamesForMetricName(ctx context.Context, req *indexgateway
 	if err != nil {
 		return nil, err
 	}
-	return &indexgatewaypb.LabelResponse{
+	return &logproto.LabelResponse{
 		Values: names,
 	}, nil
 }
 
-func (g *Gateway) LabelValuesForMetricName(ctx context.Context, req *indexgatewaypb.LabelValuesForMetricNameRequest) (*indexgatewaypb.LabelResponse, error) {
+func (g *Gateway) LabelValuesForMetricName(ctx context.Context, req *logproto.LabelValuesForMetricNameRequest) (*logproto.LabelResponse, error) {
 	instanceID, err := tenant.TenantID(ctx)
 	if err != nil {
 		return nil, err
@@ -217,16 +223,43 @@ func (g *Gateway) LabelValuesForMetricName(ctx context.Context, req *indexgatewa
 	// An empty matchers string cannot be parsed,
 	// therefore we check the string representation of the the matchers.
 	if req.Matchers != syntax.EmptyMatchers {
-		matchers, err = syntax.ParseMatchers(req.Matchers)
+		expr, err := syntax.ParseExprWithoutValidation(req.Matchers)
 		if err != nil {
 			return nil, err
 		}
+
+		matcherExpr, ok := expr.(*syntax.MatchersExpr)
+		if !ok {
+			return nil, fmt.Errorf("invalid label matchers found of type %T", expr)
+		}
+		matchers = matcherExpr.Mts
 	}
 	names, err := g.indexQuerier.LabelValuesForMetricName(ctx, instanceID, req.From, req.Through, req.MetricName, req.LabelName, matchers...)
 	if err != nil {
 		return nil, err
 	}
-	return &indexgatewaypb.LabelResponse{
+	return &logproto.LabelResponse{
 		Values: names,
 	}, nil
 }
+
+func (g *Gateway) GetStats(ctx context.Context, req *logproto.IndexStatsRequest) (*logproto.IndexStatsResponse, error) {
+	instanceID, err := tenant.TenantID(ctx)
+	if err != nil {
+		return nil, err
+	}
+	matchers, err := syntax.ParseMatchers(req.Matchers)
+	if err != nil {
+		return nil, err
+	}
+
+	return g.indexQuerier.Stats(ctx, instanceID, req.From, req.Through, matchers...)
+}
+
+type failingIndexClient struct{}
+
+func (f failingIndexClient) QueryPages(ctx context.Context, queries []index.Query, callback index.QueryPagesCallback) error {
+	return errors.New("index client is not initialized likely due to boltdb-shipper not being used")
+}
+
+func (f failingIndexClient) Stop() {}

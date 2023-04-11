@@ -69,6 +69,8 @@ type BaseLabelsBuilder struct {
 	// nolint:structcheck
 	// https://github.com/golangci/golangci-lint/issues/826
 	err string
+	// nolint:structcheck
+	errDetails string
 
 	groups            []string
 	parserKeyHints    ParserHint // label key hints for metric queries that allows to limit parser extractions to only this list of labels.
@@ -91,6 +93,10 @@ type LabelsBuilder struct {
 
 // NewBaseLabelsBuilderWithGrouping creates a new base labels builder with grouping to compute results.
 func NewBaseLabelsBuilderWithGrouping(groups []string, parserKeyHints ParserHint, without, noLabels bool) *BaseLabelsBuilder {
+	if parserKeyHints == nil {
+		parserKeyHints = noParserHints
+	}
+
 	return &BaseLabelsBuilder{
 		del:            make([]string, 0, 5),
 		add:            make([]labels.Label, 0, 16),
@@ -134,6 +140,8 @@ func (b *LabelsBuilder) Reset() {
 	b.del = b.del[:0]
 	b.add = b.add[:0]
 	b.err = ""
+	b.errDetails = ""
+	b.parserKeyHints.Reset()
 }
 
 // ParserLabelHints returns a limited list of expected labels to extract for metric queries.
@@ -156,6 +164,29 @@ func (b *LabelsBuilder) GetErr() string {
 // HasErr tells if the error label has been set.
 func (b *LabelsBuilder) HasErr() bool {
 	return b.err != ""
+}
+
+func (b *LabelsBuilder) SetErrorDetails(desc string) *LabelsBuilder {
+	b.errDetails = desc
+	return b
+}
+
+func (b *LabelsBuilder) ResetError() *LabelsBuilder {
+	b.err = ""
+	return b
+}
+
+func (b *LabelsBuilder) ResetErrorDetails() *LabelsBuilder {
+	b.errDetails = ""
+	return b
+}
+
+func (b *LabelsBuilder) GetErrorDetails() string {
+	return b.errDetails
+}
+
+func (b *LabelsBuilder) HasErrorDetails() bool {
+	return b.errDetails != ""
 }
 
 // BaseHas returns the base labels have the given key
@@ -207,18 +238,31 @@ func (b *LabelsBuilder) Set(n, v string) *LabelsBuilder {
 	}
 	b.add = append(b.add, labels.Label{Name: n, Value: v})
 
+	// Sometimes labels are set and later modified. Only record
+	// each label once
+	b.parserKeyHints.RecordExtracted(n)
 	return b
 }
 
 // Labels returns the labels from the builder. If no modifications
 // were made, the original labels are returned.
 func (b *LabelsBuilder) labels() labels.Labels {
-	b.buf = b.unsortedLabels(b.buf)
+	b.buf = b.UnsortedLabels(b.buf)
 	sort.Sort(b.buf)
 	return b.buf
 }
 
-func (b *LabelsBuilder) unsortedLabels(buf labels.Labels) labels.Labels {
+func (b *LabelsBuilder) appendErrors(buf labels.Labels) labels.Labels {
+	if b.err != "" {
+		buf = append(buf, labels.Label{Name: logqlmodel.ErrorLabel, Value: b.err})
+	}
+	if b.errDetails != "" {
+		buf = append(buf, labels.Label{Name: logqlmodel.ErrorDetailsLabel, Value: b.errDetails})
+	}
+	return buf
+}
+
+func (b *LabelsBuilder) UnsortedLabels(buf labels.Labels) labels.Labels {
 	if len(b.del) == 0 && len(b.add) == 0 {
 		if buf == nil {
 			buf = make(labels.Labels, 0, len(b.base)+1)
@@ -226,10 +270,7 @@ func (b *LabelsBuilder) unsortedLabels(buf labels.Labels) labels.Labels {
 			buf = buf[:0]
 		}
 		buf = append(buf, b.base...)
-		if b.err != "" {
-			buf = append(buf, labels.Label{Name: logqlmodel.ErrorLabel, Value: b.err})
-		}
-		return buf
+		return b.appendErrors(buf)
 	}
 
 	// In the general case, labels are removed, modified or moved
@@ -254,11 +295,7 @@ Outer:
 		buf = append(buf, l)
 	}
 	buf = append(buf, b.add...)
-	if b.err != "" {
-		buf = append(buf, labels.Label{Name: logqlmodel.ErrorLabel, Value: b.err})
-	}
-
-	return buf
+	return b.appendErrors(buf)
 }
 
 func (b *LabelsBuilder) Map() map[string]string {
@@ -268,7 +305,7 @@ func (b *LabelsBuilder) Map() map[string]string {
 		}
 		return b.baseMap
 	}
-	b.buf = b.unsortedLabels(b.buf)
+	b.buf = b.UnsortedLabels(b.buf)
 	// todo should we also cache maps since limited by the result ?
 	// Maps also don't create a copy of the labels.
 	res := make(map[string]string, len(b.buf))
@@ -403,9 +440,9 @@ func (b *LabelsBuilder) toBaseGroup() LabelsResult {
 	}
 	var lbs labels.Labels
 	if b.without {
-		lbs = b.base.WithoutLabels(b.groups...)
+		lbs = labels.NewBuilder(b.base).Del(b.groups...).Labels(nil)
 	} else {
-		lbs = b.base.WithLabels(b.groups...)
+		lbs = labels.NewBuilder(b.base).Keep(b.groups...).Labels(nil)
 	}
 	res := NewLabelsResult(lbs, lbs.Hash())
 	b.groupedResult = res

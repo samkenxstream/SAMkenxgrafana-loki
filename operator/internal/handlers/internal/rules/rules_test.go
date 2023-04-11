@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	lokiv1beta1 "github.com/grafana/loki/operator/api/v1beta1"
+	lokiv1 "github.com/grafana/loki/operator/apis/loki/v1"
 	"github.com/grafana/loki/operator/internal/external/k8s/k8sfakes"
 	"github.com/grafana/loki/operator/internal/handlers/internal/rules"
 	"github.com/stretchr/testify/require"
@@ -21,7 +21,7 @@ func TestList_AlertingRulesMatchSelector_WithDefaultStackNamespaceRules(t *testi
 	const stackNs = "some-ns"
 
 	k := &k8sfakes.FakeClient{}
-	rs := &lokiv1beta1.RulesSpec{
+	rs := &lokiv1.RulesSpec{
 		Selector: &metav1.LabelSelector{
 			MatchLabels: map[string]string{
 				"labelname": "labelvalue",
@@ -29,7 +29,7 @@ func TestList_AlertingRulesMatchSelector_WithDefaultStackNamespaceRules(t *testi
 		},
 	}
 
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
+	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object, _ ...client.GetOption) error {
 		if name.Name == stackNs {
 			k.SetClientObject(object, &corev1.Namespace{
 				ObjectMeta: metav1.ObjectMeta{
@@ -46,8 +46,8 @@ func TestList_AlertingRulesMatchSelector_WithDefaultStackNamespaceRules(t *testi
 		case *corev1.NamespaceList:
 			k.SetClientObjectList(ol, &corev1.NamespaceList{})
 			return nil
-		case *lokiv1beta1.RecordingRuleList:
-			k.SetClientObjectList(ol, &lokiv1beta1.RecordingRuleList{})
+		case *lokiv1.RecordingRuleList:
+			k.SetClientObjectList(ol, &lokiv1.RecordingRuleList{})
 			return nil
 		}
 
@@ -55,8 +55,8 @@ func TestList_AlertingRulesMatchSelector_WithDefaultStackNamespaceRules(t *testi
 		m := labels.Set(rs.Selector.MatchLabels)
 
 		if l.Matches(m) {
-			k.SetClientObjectList(ol, &lokiv1beta1.AlertingRuleList{
-				Items: []lokiv1beta1.AlertingRule{
+			k.SetClientObjectList(ol, &lokiv1.AlertingRuleList{
+				Items: []lokiv1.AlertingRule{
 					{
 						ObjectMeta: metav1.ObjectMeta{
 							Name:      "rule-a",
@@ -93,7 +93,7 @@ func TestList_AlertingRulesMatchSelector_FilteredByNamespaceSelector(t *testing.
 	const stackNs = "some-ns"
 
 	k := &k8sfakes.FakeClient{}
-	rs := &lokiv1beta1.RulesSpec{
+	rs := &lokiv1.RulesSpec{
 		Selector: &metav1.LabelSelector{
 			MatchLabels: map[string]string{
 				"labelname": "labelvalue",
@@ -106,7 +106,7 @@ func TestList_AlertingRulesMatchSelector_FilteredByNamespaceSelector(t *testing.
 		},
 	}
 
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
+	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object, _ ...client.GetOption) error {
 		if name.Name == "some-ns" {
 			k.SetClientObject(object, &corev1.Namespace{
 				ObjectMeta: metav1.ObjectMeta{
@@ -120,8 +120,8 @@ func TestList_AlertingRulesMatchSelector_FilteredByNamespaceSelector(t *testing.
 
 	k.ListStub = func(_ context.Context, ol client.ObjectList, opt ...client.ListOption) error {
 		switch ol.(type) {
-		case *lokiv1beta1.RecordingRuleList:
-			k.SetClientObjectList(ol, &lokiv1beta1.RecordingRuleList{})
+		case *lokiv1.RecordingRuleList:
+			k.SetClientObjectList(ol, &lokiv1.RecordingRuleList{})
 			return nil
 		}
 
@@ -129,8 +129,8 @@ func TestList_AlertingRulesMatchSelector_FilteredByNamespaceSelector(t *testing.
 		m := labels.Set(rs.Selector.MatchLabels)
 
 		if l.Matches(m) {
-			k.SetClientObjectList(ol, &lokiv1beta1.AlertingRuleList{
-				Items: []lokiv1beta1.AlertingRule{
+			k.SetClientObjectList(ol, &lokiv1.AlertingRuleList{
+				Items: []lokiv1.AlertingRule{
 					{
 						ObjectMeta: metav1.ObjectMeta{
 							Name:      "rule-a",
@@ -195,7 +195,7 @@ func TestList_RecordingRulesMatchSelector_WithDefaultStackNamespaceRules(t *test
 	const stackNs = "some-ns"
 
 	k := &k8sfakes.FakeClient{}
-	rs := &lokiv1beta1.RulesSpec{
+	rs := &lokiv1.RulesSpec{
 		Selector: &metav1.LabelSelector{
 			MatchLabels: map[string]string{
 				"labelname": "labelvalue",
@@ -203,7 +203,7 @@ func TestList_RecordingRulesMatchSelector_WithDefaultStackNamespaceRules(t *test
 		},
 	}
 
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
+	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object, _ ...client.GetOption) error {
 		if name.Name == stackNs {
 			k.SetClientObject(object, &corev1.Namespace{
 				ObjectMeta: metav1.ObjectMeta{
@@ -220,8 +220,8 @@ func TestList_RecordingRulesMatchSelector_WithDefaultStackNamespaceRules(t *test
 		case *corev1.NamespaceList:
 			k.SetClientObjectList(ol, &corev1.NamespaceList{})
 			return nil
-		case *lokiv1beta1.AlertingRuleList:
-			k.SetClientObjectList(ol, &lokiv1beta1.AlertingRuleList{})
+		case *lokiv1.AlertingRuleList:
+			k.SetClientObjectList(ol, &lokiv1.AlertingRuleList{})
 			return nil
 		}
 
@@ -229,8 +229,8 @@ func TestList_RecordingRulesMatchSelector_WithDefaultStackNamespaceRules(t *test
 		m := labels.Set(rs.Selector.MatchLabels)
 
 		if l.Matches(m) {
-			k.SetClientObjectList(ol, &lokiv1beta1.RecordingRuleList{
-				Items: []lokiv1beta1.RecordingRule{
+			k.SetClientObjectList(ol, &lokiv1.RecordingRuleList{
+				Items: []lokiv1.RecordingRule{
 					{
 						ObjectMeta: metav1.ObjectMeta{
 							Name:      "rule-a",
@@ -267,7 +267,7 @@ func TestList_RecordingRulesMatchSelector_FilteredByNamespaceSelector(t *testing
 	const stackNs = "some-ns"
 
 	k := &k8sfakes.FakeClient{}
-	rs := &lokiv1beta1.RulesSpec{
+	rs := &lokiv1.RulesSpec{
 		Selector: &metav1.LabelSelector{
 			MatchLabels: map[string]string{
 				"labelname": "labelvalue",
@@ -280,7 +280,7 @@ func TestList_RecordingRulesMatchSelector_FilteredByNamespaceSelector(t *testing
 		},
 	}
 
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
+	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object, _ ...client.GetOption) error {
 		if name.Name == "some-ns" {
 			k.SetClientObject(object, &corev1.Namespace{
 				ObjectMeta: metav1.ObjectMeta{
@@ -294,8 +294,8 @@ func TestList_RecordingRulesMatchSelector_FilteredByNamespaceSelector(t *testing
 
 	k.ListStub = func(_ context.Context, ol client.ObjectList, opt ...client.ListOption) error {
 		switch ol.(type) {
-		case *lokiv1beta1.AlertingRuleList:
-			k.SetClientObjectList(ol, &lokiv1beta1.AlertingRuleList{})
+		case *lokiv1.AlertingRuleList:
+			k.SetClientObjectList(ol, &lokiv1.AlertingRuleList{})
 			return nil
 		}
 
@@ -303,8 +303,8 @@ func TestList_RecordingRulesMatchSelector_FilteredByNamespaceSelector(t *testing
 		m := labels.Set(rs.Selector.MatchLabels)
 
 		if l.Matches(m) {
-			k.SetClientObjectList(ol, &lokiv1beta1.RecordingRuleList{
-				Items: []lokiv1beta1.RecordingRule{
+			k.SetClientObjectList(ol, &lokiv1.RecordingRuleList{
+				Items: []lokiv1.RecordingRule{
 					{
 						ObjectMeta: metav1.ObjectMeta{
 							Name:      "rule-a",

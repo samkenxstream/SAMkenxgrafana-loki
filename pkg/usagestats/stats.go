@@ -45,13 +45,13 @@ type Report struct {
 }
 
 // sendReport sends the report to the stats server
-func sendReport(ctx context.Context, seed *ClusterSeed, interval time.Time) error {
+func sendReport(ctx context.Context, seed *ClusterSeed, interval time.Time, URL string) error {
 	report := buildReport(seed, interval)
 	out, err := jsoniter.MarshalIndent(report, "", " ")
 	if err != nil {
 		return err
 	}
-	req, err := http.NewRequest(http.MethodPost, usageStatsURL, bytes.NewBuffer(out))
+	req, err := http.NewRequest(http.MethodPost, URL, bytes.NewBuffer(out))
 	if err != nil {
 		return err
 	}
@@ -279,7 +279,7 @@ func (s *Statistics) Record(v float64) {
 		if min <= v {
 			break
 		}
-		if s.min.CAS(min, v) {
+		if s.min.CompareAndSwap(min, v) {
 			break
 		}
 	}
@@ -288,7 +288,7 @@ func (s *Statistics) Record(v float64) {
 		if max >= v {
 			break
 		}
-		if s.max.CAS(max, v) {
+		if s.max.CompareAndSwap(max, v) {
 			break
 		}
 	}
@@ -303,7 +303,7 @@ func (s *Statistics) Record(v float64) {
 		newMean := mean + (delta / float64(newCount))
 		newValue := value + (delta * (v - newMean))
 		newAvg := avg + ((v - avg) / float64(newCount))
-		if s.avg.CAS(avg, newAvg) && s.count.CAS(count, newCount) && s.mean.CAS(mean, newMean) && s.value.CAS(value, newValue) {
+		if s.avg.CompareAndSwap(avg, newAvg) && s.count.CompareAndSwap(count, newCount) && s.mean.CompareAndSwap(mean, newMean) && s.value.CompareAndSwap(value, newValue) {
 			break
 		}
 	}
